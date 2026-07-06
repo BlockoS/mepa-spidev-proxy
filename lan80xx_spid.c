@@ -1,0 +1,1154 @@
+// Copyright (c) 2026 Vincent Jardin, Vincent Cruz, Free Mobile
+// SPDX-License-Identifier: BSD-4-Clause
+//
+// lan80xx-spid: userland SPI proxy daemon for one LAN80xx PHY package.
+// Owns the spidev node exclusively and serializes/multiplexes register
+// access for several client applications (sw-mepa, PTP agent, debug
+// tools) with sequence-level atomicity.
+//
+// Standalone: no MEPA/MESA/MEBA dependency, links libc only.
+//
+// Single-threaded epoll loop, one SPI operation in flight at a time,
+// three priority queues (PTP > normal > debug), whole-device claims
+// with client-supplied cleanup ops, in-daemon pipelined reads, op-log
+// ring.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/epoll.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <linux/types.h>
+#include <linux/spi/spidev.h>
+#include <linux/gpio.h>
+
+#include "spiproxy.h"
+
+#define MAX_CLIENTS    16
+#define MAX_QITEMS     256
+#define TRACE_RING     1024
+#define SPI_BYTES      7        /* 3 address + 4 data                    */
+#define SPI_PAD_MAX    15
+#define RST_ASSERT_US    10000  /* default HW-reset assert  (10 ms)      */
+#define RST_DEASSERT_US  100000 /* default HW-reset settle  (100 ms)     */
+#define DEVID_MMD      0x1e
+#define DEVID_REG      0x0000
+
+/* MCU mailbox (MMD 0x1e) */
+#define MB_CMD_ADDR    0xd800
+#define MB_RESP_ADDR   0xd900
+#define MB_FLAG        0xda00
+#define MB_MCU_MASK    0xda01
+#define MB_GUARD_LO    0xd800   /* foreign access denied while in flight */
+#define MB_GUARD_HI    0xdaff
+#define MB_F_BUSY      0x00000001u   /* bit0: request pending            */
+#define MB_F_RESP      0x00000002u   /* bit1: response ready             */
+#define MB_SET_REQ     0x00010000u   /* doorbell                         */
+#define MB_CLR_REQ     0x01000000u
+#define MB_CLR_RESP    0x02000000u
+#define MB_HDR_LEN     4
+#define MB_CRC_LEN     2
+#define MB_TIMEOUT_MS  500
+
+typedef struct client {
+    int      fd;
+    int      used;
+    uint32_t id;
+    pid_t    pid;
+    char     comm[20];   /* /proc/<pid>/comm of the client process */
+    uint64_t n_ops, n_msgs, n_err;
+} client_t;
+
+typedef struct qitem {
+    struct qitem *next;
+    client_t     *c;
+    struct spiproxy_hdr hdr;
+    uint8_t       body[SPIPROXY_MSG_MAX];
+} qitem_t;
+
+typedef struct {
+    uint64_t ts;
+    uint32_t cid;
+    uint8_t  slice, write, mmd;
+    uint16_t reg;
+    uint32_t val;
+} trace_ent_t;
+
+static struct {
+    const char *dev, *sock;
+    int spi_fd, srv_fd, ep_fd;
+    int pad, freq;
+    const char *rst_line;   /* reset GPIO line name (-r), NULL = disabled */
+    int         rst_fd;     /* GPIO_V2 line-request fd, -1 = unavailable  */
+    client_t cl[MAX_CLIENTS];
+    uint32_t next_cid;
+    /* queues: 0 = high (PTP), 1 = normal, 2 = low (debug) */
+    qitem_t *qh[3], *qt[3];
+    qitem_t pool[MAX_QITEMS], *freel;
+    int n_queued;
+    /* claim */
+    client_t *claim_owner;
+    uint64_t  claim_deadline;
+    struct spiproxy_op claim_cleanup[SPIPROXY_BATCH_MAX];
+    int       claim_ncleanup;
+    /* mailbox in flight (guards MB_GUARD range) */
+    int       mb_inflight;
+    /* op log */
+    trace_ent_t ring[TRACE_RING];
+    unsigned  ring_w;
+    uint64_t  n_reads, n_writes, n_io_err;
+    /* full event log (-L): every message, register op (including the
+     * internals of multi-op operations: batches, claim cleanups, the
+     * mailbox protocol traffic), claim lifecycle, client lifecycle.
+     * Lines are tagged with the owning client + request seq so a
+     * multi-op operation groups by seq. */
+    FILE     *log;
+    struct {
+        uint32_t cid;       /* client owning the current execution */
+        const char *comm;   /* its process name                      */
+        uint32_t seq;       /* its request sequence */
+        const char *tag;    /* "", "mb", "cleanup", ...              */
+    } lctx;
+    /* lint state: cross-client hazard detectors (see lint_op()) */
+    struct { uint32_t cid; char comm[20]; } page_owner[4][2];
+    struct { uint32_t cid; char comm[20]; uint64_t ts; } cor_last[2];
+    struct {
+        uint8_t  slice, mmd;
+        uint16_t reg;
+        uint32_t cid;
+        char     comm[20];
+        uint64_t ts;
+    } rd_ring[16];
+    unsigned rd_w;
+    uint64_t n_warns;
+    volatile sig_atomic_t stop;
+} g;
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+#include <stdarg.h>
+static void log_line(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (g.log == NULL) {
+        return;
+    }
+    fprintf(g.log, "%llu ", (unsigned long long)now_us());
+    va_start(ap, fmt);
+    vfprintf(g.log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g.log);
+}
+
+static void warn_line(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[256];
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g.n_warns++;
+    log_line("WARN %s", buf);
+    fprintf(stderr, "WARN %s\n", buf);
+}
+
+static const char *type_name(uint8_t t)
+{
+    static const char *n[] = {
+        "?", "READ", "WRITE", "BATCH", "CLAIM", "RELEASE", "MAILBOX",
+        "STATS", "TRACE", "TSFIFO_SUB", "BER_WINDOW", "DFU",
+    };
+    return t < sizeof(n) / sizeof(n[0]) ? n[t] : "?";
+}
+
+static const char *status_name(int st)
+{
+    static const char *n[] = {
+        "OK", "EINVAL", "EIO", "EBUSY", "ETIMEDOUT", "ENOSYS", "ECRC",
+    };
+    return st >= 0 && st < (int)(sizeof(n) / sizeof(n[0])) ? n[st] : "?";
+}
+
+/* Symbolic name for well-known registers: appended to OP log lines so
+ * the event log greps by meaning, not only by address. Returns "" when
+ * unknown.
+ */
+static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
+                            int write, char *buf)
+{
+    if (mmd == 0x1e) {
+        switch (reg) {
+        case 0x0000: return " DEVICE_ID";
+        case 0x0002: return " SILICON_REV";
+        case 0x0003: return " FEATURE_FUSES";
+        case MB_MCU_MASK: return " MB_MCU_INT_MASK";
+        case MB_MCU_MASK + 1: return " MB_HOST_INT_MASK";
+        case MB_FLAG:
+            if (write && val == MB_SET_REQ)  return " MB_FLAG doorbell";
+            if (write && val == MB_CLR_REQ)  return " MB_FLAG clr-req";
+            if (write && val == MB_CLR_RESP) return " MB_FLAG clr-resp";
+            return " MB_FLAG";
+        default:
+            if (reg >= MB_CMD_ADDR && reg <= MB_CMD_ADDR + 0xff) {
+                sprintf(buf, " MB_REQ[%u]", reg - MB_CMD_ADDR);
+                return buf;
+            }
+            if (reg >= MB_RESP_ADDR && reg <= MB_RESP_ADDR + 0xff) {
+                sprintf(buf, " MB_RESP[%u]", reg - MB_RESP_ADDR);
+                return buf;
+            }
+        }
+        return " GLOBAL";
+    }
+    if (mmd == 0x09 || mmd == 0x01) { /* HOST_PMA / LINE_PMA */
+        const char *side = mmd == 0x09 ? "HOST" : "LINE";
+        if (reg == 0xf0ff) {
+            sprintf(buf, " %s_PMA8_CMU_FF(page)", side);
+            return buf;
+        }
+        if ((reg & 0xff00) == 0xf000) {
+            sprintf(buf, " %s_PMA8_CMU_%02X", side, reg & 0xff);
+            return buf;
+        }
+        if ((reg & 0xff00) == 0xf100) {
+            sprintf(buf, " %s_PMA8_LANE_%02X", side, reg & 0xff);
+            return buf;
+        }
+        if (reg == 0x0001) {
+            sprintf(buf, " %s_PMA_STATUS1", side);
+            return buf;
+        }
+        sprintf(buf, " %s_PMA", side);
+        return buf;
+    }
+    if (mmd == 0x0b) {
+        switch (reg) {
+        case 0x0001: return " HOST_PCS_STATUS1";
+        case 0x0020: return " HOST_BASER_STATUS1";
+        case 0x0021: return " HOST_BASER_STATUS2(CoR)";
+        }
+        return " HOST_PCS25G";
+    }
+    if (mmd == 0x03) {
+        return reg == 0x0001 ? " LINE_PCS_STATUS1" : " LINE_PCS";
+    }
+    if (mmd == 0x07) {
+        return " AN";
+    }
+    buf[0] = 0;
+    return buf;
+}
+
+static void on_sig(int sig)
+{
+    (void)sig;
+    g.stop = 1;
+}
+
+/*
+ * SPI core. 23-bit address: slice<<21 | mmd<<16 | reg, write = 0x80 in
+ * byte 0. Reads are pipelined: the response to request N is clocked
+ * out during request N+1, so a logical read is one 2-transfer ioctl
+ * (request, then a dummy DEVICE_ID request that collects the data).
+ */
+static void spi_fill(uint8_t *tx, int write, uint32_t addr, uint32_t val)
+{
+    memset(tx, 0xff, SPI_BYTES + SPI_PAD_MAX);
+    tx[0] = (uint8_t)((write ? 0x80 : 0) | ((addr >> 16) & 0x7f));
+    tx[1] = (uint8_t)(addr >> 8);
+    tx[2] = (uint8_t)addr;
+    if (write) {
+        tx[3] = (uint8_t)(val >> 24);
+        tx[4] = (uint8_t)(val >> 16);
+        tx[5] = (uint8_t)(val >> 8);
+        tx[6] = (uint8_t)val;
+    }
+}
+
+static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
+{
+    uint8_t tx[SPI_BYTES + SPI_PAD_MAX], rx[sizeof(tx)];
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)tx, .rx_buf = (unsigned long)rx,
+        .len = SPI_BYTES, .speed_hz = g.freq, .bits_per_word = 8,
+    };
+    spi_fill(tx, 1, (uint32_t)slice << 21 | (uint32_t)mmd << 16 | reg, val);
+    if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(1), &tr) < 1) {
+        g.n_io_err++;
+        return -1;
+    }
+    g.n_writes++;
+    return 0;
+}
+
+static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
+{
+    uint8_t tx0[SPI_BYTES + SPI_PAD_MAX], rx0[sizeof(tx0)];
+    uint8_t tx1[sizeof(tx0)], rx1[sizeof(tx0)];
+    /* thd;ssn (DS00006161 Table 4-23) = SCK period + 12 ns: the CS
+     * high time between the two frames scales with the clock period,
+     * or the chip misses the frame boundary and streams (the response
+     * slides 2 bytes early: bench-proven at 1 MHz in the raw tools)
+     * Delay the CS toggle by 2 SCK periods. */
+    struct spi_ioc_transfer tr[2] = {
+        { .tx_buf = (unsigned long)tx0, .rx_buf = (unsigned long)rx0,
+          .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
+          .bits_per_word = 8, .cs_change = 1,
+          .delay_usecs = (uint16_t)(2000000 / g.freq + 1) },
+        { .tx_buf = (unsigned long)tx1, .rx_buf = (unsigned long)rx1,
+          .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
+          .bits_per_word = 8 },
+    };
+    spi_fill(tx0, 0, (uint32_t)slice << 21 | (uint32_t)mmd << 16 | reg, 0);
+    spi_fill(tx1, 0, (uint32_t)slice << 21 | DEVID_MMD << 16 | DEVID_REG, 0);
+    if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(2), tr) < 1) {
+        g.n_io_err++;
+        return -1;
+    }
+    *val = (uint32_t)rx1[3] << 24 | (uint32_t)rx1[4] << 16 |
+           (uint32_t)rx1[5] << 8 | rx1[6];
+    g.n_reads++;
+    return 0;
+}
+
+static void trace_add(client_t *c, const struct spiproxy_op *op)
+{
+    trace_ent_t *e = &g.ring[g.ring_w++ % TRACE_RING];
+    e->ts = now_us();
+    e->cid = c ? c->id : 0;
+    e->slice = op->slice;
+    e->write = op->write;
+    e->mmd = op->mmd;
+    e->reg = op->reg;
+    e->val = op->val;
+}
+
+/*
+ * Lint: detect cross-client violations of the multi-op conventions
+ * Only CROSS-client patterns is warned: a single client doing loose
+ * L1 sequences is its own business and would be pure noise. It claims
+ * self-quiet these detectors (foreign ops are queued, not executed).
+ *
+ *  - page-ride:  client B accesses the paged PMA8 CMU/LANE space on a
+ *    page (CMU_FF) last written by client A.
+ *  - cor-poach:  clear-on-read counter (BASER status2) read by B
+ *    within 120 s of A's read -- B consumed A's measurement window.
+ *  - rmw-race:   B writes a register that A read < 10 ms ago and has
+ *    not written back yet -- A's read-modify-write is likely torn.
+ */
+#define LINT_COR_WINDOW_US (120ULL * 1000000)
+#define LINT_RMW_WINDOW_US (10ULL * 1000)
+
+static void lint_op(const struct spiproxy_op *op)
+{
+    uint64_t now = now_us();
+    int side = op->mmd == 0x09 ? 0 : op->mmd == 0x01 ? 1 : -1;
+    unsigned i;
+
+    /* page-ride + page-owner tracking (HOST=0x09 / LINE=0x01 PMA8) */
+    if (side >= 0 && (op->reg & 0xfe00) == 0xf000) {
+        if (op->reg == 0xf0ff && op->write) {
+            g.page_owner[op->slice][side].cid = g.lctx.cid;
+            snprintf(g.page_owner[op->slice][side].comm,
+                     sizeof(g.page_owner[op->slice][side].comm), "%s",
+                     g.lctx.comm);
+        } else if (g.page_owner[op->slice][side].cid != 0 &&
+                   g.page_owner[op->slice][side].cid != g.lctx.cid) {
+            warn_line("page-ride: C%u(%s) %c s%u %02x %04x on page set by C%u(%s)",
+                      g.lctx.cid, g.lctx.comm, op->write ? 'W' : 'R',
+                      op->slice, op->mmd, op->reg,
+                      g.page_owner[op->slice][side].cid,
+                      g.page_owner[op->slice][side].comm);
+        }
+    }
+    /* cor-poach (0x0b:0x21 host / 0x03:0x21 line BASER status2) */
+    if (!op->write && op->reg == 0x0021 &&
+        (op->mmd == 0x0b || op->mmd == 0x03)) {
+        int k = op->mmd == 0x0b ? 0 : 1;
+        if (g.cor_last[k].cid != 0 && g.cor_last[k].cid != g.lctx.cid &&
+            now - g.cor_last[k].ts < LINT_COR_WINDOW_US) {
+            warn_line("cor-poach: C%u(%s) R s%u %02x 0021 %llus after C%u(%s) (counters consumed)",
+                      g.lctx.cid, g.lctx.comm, op->slice, op->mmd,
+                      (unsigned long long)((now - g.cor_last[k].ts) / 1000000),
+                      g.cor_last[k].cid, g.cor_last[k].comm);
+        }
+        g.cor_last[k].cid = g.lctx.cid;
+        g.cor_last[k].ts = now;
+        snprintf(g.cor_last[k].comm, sizeof(g.cor_last[k].comm), "%s",
+                 g.lctx.comm);
+    }
+    /* rmw-race: write to a register recently read by someone else */
+    if (op->write) {
+        for (i = 0; i < 16; i++) {
+            if (g.rd_ring[i].cid != 0 && g.rd_ring[i].cid != g.lctx.cid &&
+                g.rd_ring[i].slice == op->slice &&
+                g.rd_ring[i].mmd == op->mmd && g.rd_ring[i].reg == op->reg &&
+                now - g.rd_ring[i].ts < LINT_RMW_WINDOW_US) {
+                warn_line("rmw-race: C%u(%s) W s%u %02x %04x %llums after R by C%u(%s)",
+                          g.lctx.cid, g.lctx.comm, op->slice, op->mmd,
+                          op->reg,
+                          (unsigned long long)((now - g.rd_ring[i].ts) / 1000),
+                          g.rd_ring[i].cid, g.rd_ring[i].comm);
+                g.rd_ring[i].cid = 0;
+                break;
+            }
+        }
+    } else {
+        unsigned w = g.rd_w++ % 16;
+        g.rd_ring[w].slice = op->slice;
+        g.rd_ring[w].mmd = op->mmd;
+        g.rd_ring[w].reg = op->reg;
+        g.rd_ring[w].cid = g.lctx.cid;
+        g.rd_ring[w].ts = now;
+        snprintf(g.rd_ring[w].comm, sizeof(g.rd_ring[w].comm), "%s",
+                 g.lctx.comm);
+    }
+}
+
+/* Execute one register op; returns a spiproxy_status. */
+static int exec_op(client_t *c, struct spiproxy_op *op)
+{
+    int rc;
+
+    if (op->slice > 3) {
+        return SPIPROXY_EINVAL;
+    }
+    if (g.mb_inflight && op->mmd == DEVID_MMD &&
+        op->reg >= MB_GUARD_LO && op->reg <= MB_GUARD_HI &&
+        c != NULL) {
+        return SPIPROXY_EBUSY; /* mailbox region while a MB tx is in flight */
+    }
+    rc = op->write ? spi_write_reg(op->slice, op->mmd, op->reg, op->val)
+                   : spi_read_reg(op->slice, op->mmd, op->reg, &op->val);
+    trace_add(c, op);
+    if (rc == 0) {
+        lint_op(op);
+    }
+    if (g.log != NULL) {
+        char nb[24];
+        log_line("C%u(%s) seq=%u OP%s%s %c s%u %02x %04x = %08x%s%s",
+                 g.lctx.cid, g.lctx.comm, g.lctx.seq,
+                 g.lctx.tag[0] ? " " : "", g.lctx.tag,
+                 op->write ? 'W' : 'R', op->slice, op->mmd, op->reg,
+                 op->val, reg_name(op->mmd, op->reg, op->val, op->write, nb),
+                 rc ? " IO-ERR" : "");
+    }
+    return rc ? SPIPROXY_EIO : SPIPROXY_OK;
+}
+
+/* Mailbox-internal register access: logged with the "mb" tag so the
+ * protocol's own traffic appears in the event log too.
+ */
+static int mb_rd(uint8_t slice, uint16_t reg, uint32_t *val)
+{
+    int rc = spi_read_reg(slice, DEVID_MMD, reg, val);
+    if (g.log != NULL) {
+        char nb[24];
+        log_line("C%u(%s) seq=%u OP mb R s%u %02x %04x = %08x%s%s",
+                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, DEVID_MMD,
+                 reg, *val, reg_name(DEVID_MMD, reg, *val, 0, nb),
+                 rc ? " IO-ERR" : "");
+    }
+    return rc;
+}
+
+static int mb_wr(uint8_t slice, uint16_t reg, uint32_t val)
+{
+    int rc = spi_write_reg(slice, DEVID_MMD, reg, val);
+    if (g.log != NULL) {
+        char nb[24];
+        log_line("C%u(%s) seq=%u OP mb W s%u %02x %04x = %08x%s%s",
+                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, DEVID_MMD,
+                 reg, val, reg_name(DEVID_MMD, reg, val, 1, nb),
+                 rc ? " IO-ERR" : "");
+    }
+    return rc;
+}
+
+/*
+ * Mailbox transaction: CRC16-CCITT packet into 0xd800+, doorbell,
+ * poll FLAG bit1 (1 ms period, the wait yields to the main loop via
+ * the caller's drain hook), read response from 0xd900+, CRC check,
+ * clear. The MB_GUARD range is protected from foreign ops meanwhile.
+ */
+static uint16_t crc16_ccitt(const uint8_t *p, size_t n)
+{
+    uint16_t crc = 0xffff;
+    int i;
+    while (n--) {
+        crc ^= (uint16_t)(*p++) << 8;
+        for (i = 0; i < 8; i++) {
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+        }
+    }
+    return crc;
+}
+
+static void drain_queues(int budget); /* fwd: interleave during MB wait */
+
+static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
+                        const uint8_t *payload, uint8_t *resp,
+                        uint16_t *resp_len)
+{
+    uint8_t pkt[MB_HDR_LEN + SPIPROXY_MB_MAX + MB_CRC_LEN + 3];
+    uint32_t v, timeout = mb->timeout_ms ? mb->timeout_ms : MB_TIMEOUT_MS;
+    uint16_t len = MB_HDR_LEN + mb->payload_len + MB_CRC_LEN, crc, wlen;
+    uint64_t t_end;
+    int i;
+
+    if (mb->payload_len > SPIPROXY_MB_MAX || mb->slice > 3) {
+        return SPIPROXY_EINVAL;
+    }
+    /* build packet: {id, 0xff, len_le} + payload + crc16 */
+    pkt[0] = mb->cmd;
+    pkt[1] = 0xff;
+    pkt[2] = (uint8_t)len;
+    pkt[3] = (uint8_t)(len >> 8);
+    memcpy(pkt + MB_HDR_LEN, payload, mb->payload_len);
+    crc = crc16_ccitt(pkt, MB_HDR_LEN + mb->payload_len);
+    pkt[MB_HDR_LEN + mb->payload_len] = (uint8_t)crc;
+    pkt[MB_HDR_LEN + mb->payload_len + 1] = (uint8_t)(crc >> 8);
+
+    /* MCU busy with a previous command? */
+    if (mb_rd(mb->slice, MB_FLAG, &v)) {
+        return SPIPROXY_EIO;
+    }
+    if (v & MB_F_BUSY) {
+        return SPIPROXY_EBUSY;
+    }
+    g.mb_inflight = 1;
+    /* request words (LE), length rounded to 4 */
+    wlen = (len + 3) & ~3;
+    for (i = 0; i < wlen; i += 4) {
+        v = (uint32_t)pkt[i] | (uint32_t)pkt[i + 1] << 8 |
+            (uint32_t)pkt[i + 2] << 16 | (uint32_t)pkt[i + 3] << 24;
+        if (mb_wr(mb->slice, MB_CMD_ADDR + i / 4, v)) {
+            goto io_err;
+        }
+    }
+    /* enable MCU interrupt, ring the doorbell */
+    if (mb_rd(mb->slice, MB_MCU_MASK, &v) ||
+        mb_wr(mb->slice, MB_MCU_MASK, v | 1) ||
+        mb_wr(mb->slice, MB_FLAG, MB_SET_REQ)) {
+        goto io_err;
+    }
+    /* wait for the response flag, interleaving other clients' ops */
+    t_end = now_us() + (uint64_t)timeout * 1000;
+    for (;;) {
+        if (mb_rd(mb->slice, MB_FLAG, &v)) {
+            goto io_err;
+        }
+        if (v & MB_F_RESP) {
+            break;
+        }
+        if (now_us() > t_end) {
+            mb_wr(mb->slice, MB_FLAG, MB_CLR_REQ);
+            g.mb_inflight = 0;
+            return SPIPROXY_ETIMEDOUT;
+        }
+        drain_queues(4);     /* let foreign non-MB ops through */
+        usleep(1000);
+    }
+    /* response: word0 = header */
+    if (mb_rd(mb->slice, MB_RESP_ADDR, &v)) {
+        goto io_err;
+    }
+    len = (uint16_t)(v >> 16);
+    if (len < MB_HDR_LEN + MB_CRC_LEN || len > MB_HDR_LEN + SPIPROXY_MB_MAX + MB_CRC_LEN) {
+        mb_wr(mb->slice, MB_FLAG, MB_CLR_RESP);
+        g.mb_inflight = 0;
+        return SPIPROXY_EINVAL;
+    }
+    pkt[0] = (uint8_t)v;
+    pkt[1] = (uint8_t)(v >> 8);
+    pkt[2] = (uint8_t)(v >> 16);
+    pkt[3] = (uint8_t)(v >> 24);
+    wlen = (len + 3) & ~3;
+    for (i = 4; i < wlen; i += 4) {
+        if (mb_rd(mb->slice, MB_RESP_ADDR + i / 4, &v)) {
+            goto io_err;
+        }
+        pkt[i] = (uint8_t)v;
+        pkt[i + 1] = (uint8_t)(v >> 8);
+        pkt[i + 2] = (uint8_t)(v >> 16);
+        pkt[i + 3] = (uint8_t)(v >> 24);
+    }
+    mb_wr(mb->slice, MB_FLAG, MB_CLR_RESP);
+    g.mb_inflight = 0;
+    crc = (uint16_t)pkt[len - 2] | (uint16_t)pkt[len - 1] << 8;
+    if (crc16_ccitt(pkt, len - MB_CRC_LEN) != crc) {
+        return SPIPROXY_ECRC;
+    }
+    mb->cmd = pkt[0];
+    *resp_len = len - MB_HDR_LEN - MB_CRC_LEN;
+    memcpy(resp, pkt + MB_HDR_LEN, *resp_len);
+    (void)c;
+    return SPIPROXY_OK;
+
+io_err:
+    g.mb_inflight = 0;
+    return SPIPROXY_EIO;
+}
+
+/*
+ * Messaging
+ */
+static void send_resp(client_t *c, const struct spiproxy_hdr *req,
+                      int status, const void *body, uint32_t blen)
+{
+    uint8_t msg[sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX];
+    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
+
+    h->ver = SPIPROXY_VER;
+    h->type = req->type | SPIPROXY_RESP;
+    h->flags = (uint16_t)status;
+    h->seq = req->seq;
+    h->len = blen;
+    if (blen) {
+        memcpy(msg + sizeof(*h), body, blen);
+    }
+    if (send(c->fd, msg, sizeof(*h) + blen, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
+        c->n_err++;
+    }
+    log_line("C%u(%s) seq=%u RSP %s st=%s len=%u", c->id, c->comm, req->seq,
+             type_name(req->type), status_name(status), blen);
+}
+
+static void claim_end(int abnormal)
+{
+    int i;
+
+    log_line("C%u(%s) CLAIM end %s%s",
+             g.claim_owner ? g.claim_owner->id : 0,
+             g.claim_owner ? g.claim_owner->comm : "?",
+             abnormal ? "ABNORMAL" : "normal",
+             (abnormal && g.claim_ncleanup) ? " (running cleanup ops)" : "");
+    if (abnormal && g.claim_ncleanup) {
+        fprintf(stderr, "claim by client %u ended abnormally: running %d cleanup ops\n",
+                g.claim_owner ? g.claim_owner->id : 0, g.claim_ncleanup);
+        g.lctx.cid = g.claim_owner ? g.claim_owner->id : 0;
+        g.lctx.comm = g.claim_owner ? g.claim_owner->comm : "?";
+        g.lctx.seq = 0;
+        g.lctx.tag = "cleanup";
+        for (i = 0; i < g.claim_ncleanup; i++) {
+            exec_op(NULL, &g.claim_cleanup[i]);
+        }
+        g.lctx.tag = "";
+    }
+    g.claim_owner = NULL;
+    g.claim_ncleanup = 0;
+    g.claim_deadline = 0;
+}
+
+/*
+ * Reset GPIO via the kernel GPIO v2 character-device uapi (libc-only,
+ * no libgpiod). Resolve the line by NAME (the gpio-line-names entry
+ * the board DT assigns, e.g. "lan8023-rst") so the daemon does not
+ * hard-code a chip/offset. Requested as output; the line comes up LOW
+ * = deasserted (PHY running). Returns the line-request fd or -1.
+ */
+static int gpio_open_line_by_name(const char *name)
+{
+    char path[sizeof("/dev/gpiochip") + 11];   /* + up to 11 digits of an int */
+    int n, fd = -1;
+
+    for (n = 0; n < 64 && fd < 0; n++) {
+        struct gpiochip_info ci;
+        uint32_t off;
+        int chip;
+
+        snprintf(path, sizeof(path), "/dev/gpiochip%d", n);
+        chip = open(path, O_RDONLY | O_CLOEXEC);
+        if (chip < 0)
+            continue;
+        memset(&ci, 0, sizeof(ci));
+        if (ioctl(chip, GPIO_GET_CHIPINFO_IOCTL, &ci) == 0) {
+            for (off = 0; off < ci.lines; off++) {
+                struct gpio_v2_line_info li;
+                struct gpio_v2_line_request req;
+
+                memset(&li, 0, sizeof(li));
+                li.offset = off;
+                if (ioctl(chip, GPIO_V2_GET_LINEINFO_IOCTL, &li) ||
+                    strcmp(li.name, name))
+                    continue;
+                memset(&req, 0, sizeof(req));
+                req.offsets[0] = off;
+                req.num_lines = 1;
+                req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+                strncpy(req.consumer, "lan80xx-spid",
+                        sizeof(req.consumer) - 1);
+                if (ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &req) == 0 &&
+                    req.fd >= 0) {
+                    fd = req.fd;
+                    fprintf(stderr, "reset GPIO '%s' = %s line %u\n",
+                            name, ci.name, off);
+                }
+                break;
+            }
+        }
+        close(chip);
+    }
+    if (fd < 0)
+        fprintf(stderr, "reset GPIO '%s' not found on any gpiochip\n", name);
+    return fd;
+}
+
+static int gpio_set(int fd, int value)
+{
+    struct gpio_v2_line_values v = { .bits = value ? 1 : 0, .mask = 1 };
+
+    return ioctl(fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &v);
+}
+
+/* Pulse the reset line: assert (ACTIVE_HIGH -> high), hold, release
+ * (low -> PHY runs), settle. Caller has ensured g.rst_fd >= 0. */
+static void gpio_pulse_reset(uint32_t assert_us, uint32_t deassert_us)
+{
+    gpio_set(g.rst_fd, 1);
+    usleep(assert_us);
+    gpio_set(g.rst_fd, 0);
+    usleep(deassert_us);
+}
+
+static void exec_item(qitem_t *it)
+{
+    client_t *c = it->c;
+    struct spiproxy_hdr *h = &it->hdr;
+
+    g.lctx.cid = c->id;
+    g.lctx.comm = c->comm;
+    g.lctx.seq = h->seq;
+    g.lctx.tag = "";
+    struct spiproxy_op *ops = (struct spiproxy_op *)it->body;
+    char txt[SPIPROXY_MSG_MAX];
+    int st, i, n, len;
+
+    switch (h->type) {
+    case SPIPROXY_READ:
+    case SPIPROXY_WRITE:
+        if (h->len != sizeof(*ops)) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        ops->write = (h->type == SPIPROXY_WRITE);
+        st = exec_op(c, ops);
+        c->n_ops++;
+        send_resp(c, h, st, ops, sizeof(*ops));
+        return;
+    case SPIPROXY_BATCH:
+        n = (int)(h->len / sizeof(*ops));
+        if (n < 1 || n > SPIPROXY_BATCH_MAX || h->len % sizeof(*ops)) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        st = SPIPROXY_OK;
+        for (i = 0; i < n && st == SPIPROXY_OK; i++) {
+            st = exec_op(c, &ops[i]); /* atomic: nothing interleaves */
+        }
+        c->n_ops += i;
+        send_resp(c, h, st, ops, h->len);
+        return;
+    case SPIPROXY_CLAIM: {
+        struct spiproxy_claim *cl = (struct spiproxy_claim *)it->body;
+        if (h->len < sizeof(*cl) ||
+            cl->ncleanup > SPIPROXY_BATCH_MAX ||
+            h->len != sizeof(*cl) + cl->ncleanup * sizeof(*ops)) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        if (g.claim_owner && g.claim_owner != c) {
+            send_resp(c, h, SPIPROXY_EBUSY, NULL, 0);
+            return;
+        }
+        g.claim_owner = c;
+        log_line("C%u(%s) seq=%u CLAIM grant max_ms=%u ncleanup=%u", c->id,
+                 c->comm, h->seq, cl->max_ms, cl->ncleanup);
+        g.claim_deadline = now_us() + (uint64_t)cl->max_ms * 1000;
+        g.claim_ncleanup = cl->ncleanup;
+        memcpy(g.claim_cleanup, it->body + sizeof(*cl),
+               cl->ncleanup * sizeof(*ops));
+        send_resp(c, h, SPIPROXY_OK, NULL, 0);
+        return;
+    }
+    case SPIPROXY_RELEASE:
+        if (g.claim_owner == c) {
+            claim_end(0);
+        }
+        send_resp(c, h, SPIPROXY_OK, NULL, 0);
+        return;
+    case SPIPROXY_MAILBOX: {
+        struct spiproxy_mb *mb = (struct spiproxy_mb *)it->body;
+        uint8_t resp[sizeof(*mb) + SPIPROXY_MB_MAX];
+        uint16_t rlen = 0;
+        if (h->len != sizeof(*mb) + mb->payload_len) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        st = exec_mailbox(c, mb, it->body + sizeof(*mb),
+                          resp + sizeof(*mb), &rlen);
+        mb->payload_len = rlen;
+        memcpy(resp, mb, sizeof(*mb));
+        send_resp(c, h, st, resp, sizeof(*mb) + (st == SPIPROXY_OK ? rlen : 0));
+        return;
+    }
+    case SPIPROXY_STATS: {
+        len = snprintf(txt, sizeof(txt),
+                       "dev=%s freq=%d pad=%d rst=%s reads=%llu writes=%llu io_err=%llu warns=%llu queued=%d claim=%u mb_inflight=%d\n",
+                       g.dev, g.freq, g.pad,
+                       g.rst_fd >= 0 ? (g.rst_line ? g.rst_line : "on") : "off",
+                       (unsigned long long)g.n_reads,
+                       (unsigned long long)g.n_writes,
+                       (unsigned long long)g.n_io_err,
+                       (unsigned long long)g.n_warns, g.n_queued,
+                       g.claim_owner ? g.claim_owner->id : 0, g.mb_inflight);
+        for (i = 0; i < MAX_CLIENTS; i++) {
+            if (g.cl[i].used) {
+                len += snprintf(txt + len, sizeof(txt) - len,
+                                "client %u(%s) pid %d msgs=%llu ops=%llu err=%llu\n",
+                                g.cl[i].id, g.cl[i].comm, (int)g.cl[i].pid,
+                                (unsigned long long)g.cl[i].n_msgs,
+                                (unsigned long long)g.cl[i].n_ops,
+                                (unsigned long long)g.cl[i].n_err);
+            }
+        }
+        send_resp(c, h, SPIPROXY_OK, txt, (uint32_t)len);
+        return;
+    }
+    case SPIPROXY_TRACE: {
+        unsigned start = g.ring_w > 64 ? g.ring_w - 64 : 0, w;
+        len = 0;
+        for (w = start; w < g.ring_w && len < (int)sizeof(txt) - 64; w++) {
+            trace_ent_t *e = &g.ring[w % TRACE_RING];
+            len += snprintf(txt + len, sizeof(txt) - len,
+                            "%llu c%u %c %u %02x %04x %08x\n",
+                            (unsigned long long)e->ts, e->cid,
+                            e->write ? 'W' : 'R', e->slice, e->mmd,
+                            e->reg, e->val);
+        }
+        send_resp(c, h, SPIPROXY_OK, txt, (uint32_t)len);
+        return;
+    }
+    case SPIPROXY_RESET: {
+        struct spiproxy_reset *rq = (struct spiproxy_reset *)it->body;
+        uint32_t a, d;
+
+        if (h->len != sizeof(*rq)) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        if (g.rst_fd < 0) {     /* no reset line configured (-r) / found */
+            send_resp(c, h, SPIPROXY_ENOSYS, NULL, 0);
+            return;
+        }
+        a = rq->assert_us ? rq->assert_us : RST_ASSERT_US;
+        d = rq->deassert_us ? rq->deassert_us : RST_DEASSERT_US;
+        /*
+         * Single-threaded loop + sole spidev owner: no SPI op is in
+         * flight here, so the HW reset is atomic vs all client traffic.
+         * After this the chip is fresh, so any in-flight mailbox guard
+         * is moot -- clear it.
+         */
+        g.mb_inflight = 0;
+        gpio_pulse_reset(a, d);
+        log_line("C%u(%s) seq=%u RESET hw assert=%uus deassert=%uus", c->id,
+                 c->comm, h->seq, a, d);
+        send_resp(c, h, SPIPROXY_OK, NULL, 0);
+        return;
+    }
+    default:
+        send_resp(c, h, SPIPROXY_ENOSYS, NULL, 0);
+        return;
+    }
+}
+
+/*
+ * Queues. An item is eligible unless a foreign claim holds the device
+ * (control messages from anyone stay eligible so claims can be
+ * queried/released and stats keep working).
+ */
+static int item_eligible(qitem_t *it)
+{
+    if (g.claim_owner == NULL || it->c == g.claim_owner) {
+        return 1;
+    }
+    return it->hdr.type >= SPIPROXY_CLAIM && it->hdr.type != SPIPROXY_MAILBOX;
+}
+
+static void drain_queues(int budget)
+{
+    int q;
+
+    while (budget--) {
+        qitem_t *it = NULL, **pp = NULL;
+        for (q = 0; q < 3 && it == NULL; q++) {
+            for (pp = &g.qh[q]; *pp; pp = &(*pp)->next) {
+                if (item_eligible(*pp)) {
+                    it = *pp;
+                    *pp = it->next;
+                    if (g.qt[q] == it) {
+                        /* recompute tail */
+                        qitem_t *t = g.qh[q];
+                        while (t && t->next) {
+                            t = t->next;
+                        }
+                        g.qt[q] = t;
+                    }
+                    break;
+                }
+            }
+        }
+        if (it == NULL) {
+            return;
+        }
+        g.n_queued--;
+        exec_item(it);
+        it->next = g.freel;
+        g.freel = it;
+    }
+}
+
+static void enqueue(client_t *c, struct spiproxy_hdr *h, uint8_t *body)
+{
+    int q = (h->flags & 3) == SPIPROXY_PRIO_HIGH ? 0 :
+            (h->flags & 3) == SPIPROXY_PRIO_LOW  ? 2 : 1;
+    qitem_t *it = g.freel;
+
+    if (it == NULL) {
+        send_resp(c, h, SPIPROXY_EBUSY, NULL, 0); /* queue full */
+        return;
+    }
+    g.freel = it->next;
+    it->next = NULL;
+    it->c = c;
+    it->hdr = *h;
+    log_line("C%u(%s) seq=%u REQ %s prio=%u len=%u", c->id, c->comm, h->seq,
+             type_name(h->type), h->flags & 3, h->len);
+    memcpy(it->body, body, h->len);
+    if (g.qt[q]) {
+        g.qt[q]->next = it;
+    } else {
+        g.qh[q] = it;
+    }
+    g.qt[q] = it;
+    g.n_queued++;
+}
+
+static void client_drop(client_t *c)
+{
+    int q;
+    qitem_t **pp;
+
+    if (g.claim_owner == c) {
+        claim_end(1); /* abnormal: run the cleanup ops */
+    }
+    for (q = 0; q < 3; q++) {
+        for (pp = &g.qh[q]; *pp;) {
+            if ((*pp)->c == c) {
+                qitem_t *it = *pp;
+                *pp = it->next;
+                it->next = g.freel;
+                g.freel = it;
+                g.n_queued--;
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+        g.qt[q] = g.qh[q];
+        while (g.qt[q] && g.qt[q]->next) {
+            g.qt[q] = g.qt[q]->next;
+        }
+    }
+    epoll_ctl(g.ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    c->used = 0;
+    log_line("C%u(%s) EVT disconnect", c->id, c->comm);
+}
+
+static void client_msg(client_t *c)
+{
+    uint8_t msg[sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX];
+    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
+    ssize_t n = recv(c->fd, msg, sizeof(msg), 0);
+
+    if (n <= 0) {
+        client_drop(c);
+        return;
+    }
+    if ((size_t)n < sizeof(*h) || h->ver != SPIPROXY_VER ||
+        h->len != (uint32_t)n - sizeof(*h) || h->len > SPIPROXY_MSG_MAX) {
+        struct spiproxy_hdr bad = { .type = 0, .seq = 0 };
+        send_resp(c, (size_t)n >= sizeof(*h) ? h : &bad, SPIPROXY_EINVAL, NULL, 0);
+        return;
+    }
+    c->n_msgs++;
+    enqueue(c, h, msg + sizeof(*h));
+}
+
+static void accept_client(void)
+{
+    struct ucred uc = { 0 };
+    socklen_t ul = sizeof(uc);
+    struct epoll_event ev = { .events = EPOLLIN };
+    int fd = accept(g.srv_fd, NULL, NULL), i;
+
+    if (fd < 0) {
+        return;
+    }
+    for (i = 0; i < MAX_CLIENTS && g.cl[i].used; i++) {
+        ;
+    }
+    if (i == MAX_CLIENTS) {
+        close(fd);
+        return;
+    }
+    getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &ul);
+    g.cl[i] = (client_t){ .fd = fd, .used = 1, .id = ++g.next_cid, .pid = uc.pid };
+    {
+        char path[40];
+        FILE *fp;
+        snprintf(path, sizeof(path), "/proc/%d/comm", (int)uc.pid);
+        if ((fp = fopen(path, "r")) != NULL) {
+            if (fgets(g.cl[i].comm, sizeof(g.cl[i].comm), fp) != NULL) {
+                g.cl[i].comm[strcspn(g.cl[i].comm, "\n")] = 0;
+            }
+            fclose(fp);
+        }
+        if (g.cl[i].comm[0] == 0) {
+            snprintf(g.cl[i].comm, sizeof(g.cl[i].comm), "?");
+        }
+    }
+    ev.data.ptr = &g.cl[i];
+    epoll_ctl(g.ep_fd, EPOLL_CTL_ADD, fd, &ev);
+    fprintf(stderr, "client %u connected (pid %d)\n", g.cl[i].id, (int)uc.pid);
+    log_line("C%u(%s) EVT connect pid=%d", g.cl[i].id, g.cl[i].comm, (int)uc.pid);
+}
+
+static void usage(const char *p)
+{
+    fprintf(stderr,
+            "Usage: %s -d /dev/spidevX.Y [-s sock] [-p pad] [-f hz]\n"
+            "  -d  spidev of the LAN80xx package (required)\n"
+            "  -s  listening socket (default %s)\n"
+            "  -p  SPI padding bytes for reads (default 1)\n"
+            "  -f  SPI clock in Hz (default 5000000)\n"
+            "  -r  reset GPIO line NAME (e.g. lan8023-rst) -- enables the\n"
+            "      SPIPROXY_RESET op (HW reset pulse); off if absent\n"
+            "  -L  full event log to <file> ('-' = stderr): every message,\n"
+            "      register op (incl. batch/claim-cleanup/mailbox internals),\n"
+            "      claim + client lifecycle\n", p, SPIPROXY_SOCK);
+}
+
+int main(int argc, char **argv)
+{
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    struct epoll_event ev = { .events = EPOLLIN }, evs[8];
+    uint32_t id = 0;
+    int o, i, mode = 0;
+
+    g.sock = SPIPROXY_SOCK;
+    g.pad = 1;
+    g.freq = 5000000;
+    g.rst_fd = -1;
+    while ((o = getopt(argc, argv, "d:s:p:f:r:L:h")) != -1) {
+        switch (o) {
+        case 'd': g.dev = optarg; break;
+        case 's': g.sock = optarg; break;
+        case 'p': g.pad = atoi(optarg); break;
+        case 'f': g.freq = atoi(optarg); break;
+        case 'r': g.rst_line = optarg; break;
+        case 'L':
+            g.log = strcmp(optarg, "-") ? fopen(optarg, "w") : stderr;
+            if (g.log == NULL) {
+                perror(optarg);
+                return 1;
+            }
+            setvbuf(g.log, NULL, _IOLBF, 0);
+            break;
+        default: usage(argv[0]); return 1;
+        }
+    }
+    g.lctx.tag = "";
+    if (g.dev == NULL || g.pad < 0 || g.pad > SPI_PAD_MAX) {
+        usage(argv[0]);
+        return 1;
+    }
+    if ((g.spi_fd = open(g.dev, O_RDWR)) < 0) {
+        perror(g.dev);
+        return 1;
+    }
+    if (flock(g.spi_fd, LOCK_EX | LOCK_NB)) {
+        fprintf(stderr, "%s: already locked (another owner?)\n", g.dev);
+        return 1;
+    }
+    ioctl(g.spi_fd, SPI_IOC_WR_MODE, &mode);
+    /* startup sanity: DEVICE_ID must answer on slice 0 */
+    if (spi_read_reg(0, DEVID_MMD, DEVID_REG, &id) || (id & 0xff00) != 0x8000) {
+        fprintf(stderr, "warning: DEVICE_ID read %#x -- PHY not answering?\n", id);
+    } else {
+        fprintf(stderr, "%s: LAN80xx DEVICE_ID %#06x\n", g.dev, id);
+    }
+
+    /* Optional HW reset line (-r <line-name>): enables SPIPROXY_RESET. */
+    if (g.rst_line)
+        g.rst_fd = gpio_open_line_by_name(g.rst_line);
+
+    strncpy(sa.sun_path, g.sock, sizeof(sa.sun_path) - 1);
+    unlink(g.sock);
+    g.srv_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (bind(g.srv_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
+        listen(g.srv_fd, 8)) {
+        perror(g.sock);
+        return 1;
+    }
+    g.ep_fd = epoll_create1(EPOLL_CLOEXEC);
+    ev.data.ptr = NULL; /* NULL = listening socket */
+    epoll_ctl(g.ep_fd, EPOLL_CTL_ADD, g.srv_fd, &ev);
+    for (i = 0; i < MAX_QITEMS - 1; i++) {
+        g.pool[i].next = &g.pool[i + 1];
+    }
+    g.freel = &g.pool[0];
+    signal(SIGINT, on_sig);
+    signal(SIGTERM, on_sig);
+    signal(SIGPIPE, SIG_IGN);
+    fprintf(stderr, "lan80xx-spid: %s @%d Hz pad %d, socket %s\n",
+            g.dev, g.freq, g.pad, g.sock);
+
+    while (!g.stop) {
+        int timeout = g.n_queued ? 0 : (g.claim_owner ? 100 : -1);
+        int n = epoll_wait(g.ep_fd, evs, 8, timeout);
+        for (i = 0; i < n; i++) {
+            if (evs[i].data.ptr == NULL) {
+                accept_client();
+            } else {
+                client_msg(evs[i].data.ptr);
+            }
+        }
+        if (g.claim_owner && now_us() > g.claim_deadline) {
+            fprintf(stderr, "claim by client %u expired\n", g.claim_owner->id);
+            log_line("C%u CLAIM expired", g.claim_owner->id);
+            claim_end(1);
+        }
+        drain_queues(64);
+    }
+    unlink(g.sock);
+    fprintf(stderr, "lan80xx-spid: exit\n");
+    return 0;
+}
