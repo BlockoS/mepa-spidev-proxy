@@ -1,4 +1,4 @@
-# spi_proxy_mepa
+# mepa_spidev_proxy
 
 Standalone SPI proxy daemon (`lan80xx-spid`) and its debug CLI
 (`spiproxy-cli`) for the Microchip LAN80xx 25G PHY.
@@ -54,9 +54,9 @@ Installing:
 <prefix>/bin/lan80xx-spid
 <prefix>/bin/spiproxy-cli
 <prefix>/include/spi_proxy/spiproxy.h            # the protocol API/contract
-<prefix>/lib/cmake/spi_proxy_mepa/spi_proxy_mepaConfig.cmake     # find_package()
-<prefix>/lib/cmake/spi_proxy_mepa/spi_proxy_mepaTargets.cmake
-<prefix>/lib/cmake/spi_proxy_mepa/spi_proxy_mepaConfigVersion.cmake
+<prefix>/lib/cmake/mepa_spidev_proxy/mepa_spidev_proxyConfig.cmake     # find_package()
+<prefix>/lib/cmake/mepa_spidev_proxy/mepa_spidev_proxyTargets.cmake
+<prefix>/lib/cmake/mepa_spidev_proxy/mepa_spidev_proxyConfigVersion.cmake
 ```
 
 ### Options
@@ -75,22 +75,22 @@ cmake -B build -S . -DSPIPROXY_STATIC=ON
 `spiproxy.h` protocol in its `-P proxy:<sock>` mode. Its build does
 
 ```cmake
-find_package(spi_proxy_mepa CONFIG QUIET)
+find_package(mepa_spidev_proxy CONFIG QUIET)
 ```
 
 - If this package is installed and found, `sw-mepa` links
-  `spi_proxy_mepa::spiproxy` (which supplies `<spi_proxy/spiproxy.h>`), defines
+  `mepa_spidev_proxy::spiproxy` (which supplies `<spi_proxy/spiproxy.h>`), defines
   `MEPA_HAS_SPIPROXY`, and the `-P proxy:<sock>` client mode is compiled in.
 - If it is not found, `sw-mepa` builds normally without proxy mode
   (direct-spidev PHY-only access still works).
 
-So install `spi_proxy_mepa` first, then point `sw-mepa`'s configure at the same
+So install `mepa_spidev_proxy` first, then point `sw-mepa`'s configure at the same
 prefix:
 
 ```sh
-cmake --install <spi_proxy_mepa-build> --prefix /opt/mepa
+cmake --install <mepa_spidev_proxy-build> --prefix /opt/mepa
 # ... then, when configuring sw-mepa:
-#   -DCMAKE_PREFIX_PATH=/opt/mepa   (so its find_package(spi_proxy_mepa) hits)
+#   -DCMAKE_PREFIX_PATH=/opt/mepa   (so its find_package(mepa_spidev_proxy) hits)
 ```
 
 Any other application (a PTP agent, custom tooling) consumes the same package

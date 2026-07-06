@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-4-Clause
 
 cmake_minimum_required(VERSION 3.15)
-project(spi_proxy_mepa VERSION 2026.01 LANGUAGES C)
+project(mepa_spidev_proxy VERSION 2026.07 LANGUAGES C)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -14,13 +14,13 @@ option(SPIPROXY_STATIC "Link the executables statically" OFF)
 
 # development package: the wire-protocol API/contract
 add_library(spiproxy INTERFACE)
-add_library(spi_proxy_mepa::spiproxy ALIAS spiproxy)
+add_library(mepa_spidev_proxy::spiproxy ALIAS spiproxy)
 target_include_directories(spiproxy INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 install(FILES spiproxy.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/spi_proxy)
-install(TARGETS spiproxy EXPORT spi_proxy_mepaTargets)
+install(TARGETS spiproxy EXPORT mepa_spidev_proxyTargets)
 
 # the spi proxy daemon + debug CLI
 add_executable(lan80xx_spid lan80xx_spid.c)
@@ -37,19 +37,19 @@ endif()
 install(TARGETS lan80xx_spid spiproxy_cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-install(EXPORT spi_proxy_mepaTargets
-        FILE spi_proxy_mepaTargets.cmake
-        NAMESPACE spi_proxy_mepa::
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spi_proxy_mepa)
+install(EXPORT mepa_spidev_proxyTargets
+        FILE mepa_spidev_proxyTargets.cmake
+        NAMESPACE mepa_spidev_proxy::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mepa_spidev_proxy)
 
 configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/spi_proxy_mepaConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/spi_proxy_mepaConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spi_proxy_mepa)
+    ${CMAKE_CURRENT_SOURCE_DIR}/mepa_spidev_proxyConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/mepa_spidev_proxyConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mepa_spidev_proxy)
 write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/spi_proxy_mepaConfigVersion.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/mepa_spidev_proxyConfigVersion.cmake
     COMPATIBILITY AnyNewerVersion)
 install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/spi_proxy_mepaConfig.cmake
-        ${CMAKE_CURRENT_BINARY_DIR}/spi_proxy_mepaConfigVersion.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spi_proxy_mepa)
+        ${CMAKE_CURRENT_BINARY_DIR}/mepa_spidev_proxyConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/mepa_spidev_proxyConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mepa_spidev_proxy)
