@@ -10,7 +10,20 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Default to an optimized build when none is chosen, so _FORTIFY_SOURCE
+# (below) is effective -- it is inert without -O1+.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 add_compile_options(-Wall -Wextra -Wshadow)
+
+# Fortify libc buffer calls (runtime overflow checks). Only in optimized
+# configs (inert otherwise); -U first so it stays warning-free even when a
+# buildroot/yocto toolchain already defines _FORTIFY_SOURCE.
+add_compile_options(
+    "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE>"
+    "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=2>")
 
 option(SPIPROXY_STATIC "Link the executables statically" OFF)
 
