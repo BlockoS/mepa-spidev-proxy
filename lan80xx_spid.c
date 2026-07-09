@@ -39,6 +39,11 @@
 #define MAX_CLIENTS    16
 #define MAX_QITEMS     256
 #define TRACE_RING     1024
+#define RD_RING_COUNT  16       /* rmw-race read-tracking ring depth      */
+#define TRACE_TAIL_MAX 64       /* trace entries returned by SPIPROXY_TRACE */
+#define TRACE_LINE_MAX 64       /* max bytes one trace line emits         */
+#define SLICE_COUNT    4        /* SPI slices per package (0..3)          */
+#define SIDE_COUNT     2        /* PHY sides: HOST / LINE                 */
 #define USEC_PER_SEC   1000000u
 #define SPI_BYTES      7        /* 3 address + 4 data                    */
 #define SPI_PAD_MAX    15
@@ -68,6 +73,7 @@
 #define MB_TIMEOUT_MS  500
 
 #define COMM_PATH_MAX (20U)
+#define REG_NAME_BUF   32       /* reg_name() output buffer size          */
 
 typedef struct client {
     int      fd;
@@ -129,15 +135,15 @@ static struct {
         const char *tag;    /* "", "mb", "cleanup", ...              */
     } lctx;
     /* lint state: cross-client hazard detectors (see lint_op()) */
-    struct { uint32_t cid; char comm[COMM_PATH_MAX]; } page_owner[4][2];
-    struct { uint32_t cid; char comm[COMM_PATH_MAX]; uint64_t ts; } cor_last[2];
+    struct { uint32_t cid; char comm[COMM_PATH_MAX]; } page_owner[SLICE_COUNT][SIDE_COUNT];
+    struct { uint32_t cid; char comm[COMM_PATH_MAX]; uint64_t ts; } cor_last[SIDE_COUNT];
     struct {
         uint8_t  slice, mmd;
         uint16_t reg;
         uint32_t cid;
         char     comm[COMM_PATH_MAX];
         uint64_t ts;
-    } rd_ring[16];
+    } rd_ring[RD_RING_COUNT];
     unsigned rd_w;
     uint64_t n_warns;
     volatile sig_atomic_t stop;
@@ -199,7 +205,7 @@ static const char *status_name(int st)
  * unknown.
  */
 static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
-                            int write, char *buf)
+                            int write, char buf[REG_NAME_BUF])
 {
     if (mmd == LAN80XX_MMD_GLOBAL) {
         switch (reg) {
@@ -215,11 +221,11 @@ static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
             return " MB_FLAG";
         default:
             if (reg >= MB_CMD_ADDR && reg <= MB_CMD_ADDR + 0xff) {
-                sprintf(buf, " MB_REQ[%u]", reg - MB_CMD_ADDR);
+                snprintf(buf, REG_NAME_BUF, " MB_REQ[%u]", reg - MB_CMD_ADDR);
                 return buf;
             }
             if (reg >= MB_RESP_ADDR && reg <= MB_RESP_ADDR + 0xff) {
-                sprintf(buf, " MB_RESP[%u]", reg - MB_RESP_ADDR);
+                snprintf(buf, REG_NAME_BUF, " MB_RESP[%u]", reg - MB_RESP_ADDR);
                 return buf;
             }
         }
@@ -228,22 +234,22 @@ static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
     if (mmd == LAN80XX_MMD_HOST_PMA || mmd == LAN80XX_MMD_LINE_PMA) {
         const char *side = mmd == LAN80XX_MMD_HOST_PMA ? "HOST" : "LINE";
         if (reg == 0xf0ff) {
-            sprintf(buf, " %s_PMA8_CMU_FF(page)", side);
+            snprintf(buf, REG_NAME_BUF, " %s_PMA8_CMU_FF(page)", side);
             return buf;
         }
         if ((reg & 0xff00) == 0xf000) {
-            sprintf(buf, " %s_PMA8_CMU_%02X", side, reg & 0xff);
+            snprintf(buf, REG_NAME_BUF, " %s_PMA8_CMU_%02X", side, reg & 0xff);
             return buf;
         }
         if ((reg & 0xff00) == 0xf100) {
-            sprintf(buf, " %s_PMA8_LANE_%02X", side, reg & 0xff);
+            snprintf(buf, REG_NAME_BUF, " %s_PMA8_LANE_%02X", side, reg & 0xff);
             return buf;
         }
         if (reg == 0x0001) {
-            sprintf(buf, " %s_PMA_STATUS1", side);
+            snprintf(buf, REG_NAME_BUF, " %s_PMA_STATUS1", side);
             return buf;
         }
-        sprintf(buf, " %s_PMA", side);
+        snprintf(buf, REG_NAME_BUF, " %s_PMA", side);
         return buf;
     }
     if (mmd == LAN80XX_MMD_HOST_PCS) {
@@ -414,7 +420,7 @@ static void lint_op(const struct spiproxy_op *op)
     }
     /* rmw-race: write to a register recently read by someone else */
     if (op->write) {
-        for (i = 0; i < 16; i++) {
+        for (i = 0; i < RD_RING_COUNT; i++) {
             if (g.rd_ring[i].cid != 0 && g.rd_ring[i].cid != g.lctx.cid &&
                 g.rd_ring[i].slice == op->slice &&
                 g.rd_ring[i].mmd == op->mmd && g.rd_ring[i].reg == op->reg &&
@@ -429,7 +435,7 @@ static void lint_op(const struct spiproxy_op *op)
             }
         }
     } else {
-        unsigned w = g.rd_w++ % 16;
+        unsigned w = g.rd_w++ % RD_RING_COUNT;
         g.rd_ring[w].slice = op->slice;
         g.rd_ring[w].mmd = op->mmd;
         g.rd_ring[w].reg = op->reg;
@@ -445,7 +451,7 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
 {
     int rc;
 
-    if (op->slice > 3) {
+    if (op->slice >= SLICE_COUNT) {
         return SPIPROXY_EINVAL;
     }
     if (g.mb_inflight && op->mmd == LAN80XX_MMD_GLOBAL &&
@@ -460,7 +466,7 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
         lint_op(op);
     }
     if (g.log != NULL) {
-        char nb[24];
+        char nb[REG_NAME_BUF];
         log_line("C%u(%s) seq=%u OP%s%s %c s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq,
                  g.lctx.tag[0] ? " " : "", g.lctx.tag,
@@ -478,7 +484,7 @@ static int mb_rd(uint8_t slice, uint16_t reg, uint32_t *val)
 {
     int rc = spi_read_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
-        char nb[24];
+        char nb[REG_NAME_BUF];
         log_line("C%u(%s) seq=%u OP mb R s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
                  reg, *val, reg_name(LAN80XX_MMD_GLOBAL, reg, *val, 0, nb),
@@ -491,7 +497,7 @@ static int mb_wr(uint8_t slice, uint16_t reg, uint32_t val)
 {
     int rc = spi_write_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
-        char nb[24];
+        char nb[REG_NAME_BUF];
         log_line("C%u(%s) seq=%u OP mb W s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
                  reg, val, reg_name(LAN80XX_MMD_GLOBAL, reg, val, 1, nb),
@@ -531,7 +537,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
     uint64_t t_end;
     int i;
 
-    if (mb->payload_len > SPIPROXY_MB_MAX || mb->slice > 3) {
+    if (mb->payload_len > SPIPROXY_MB_MAX || mb->slice >= SLICE_COUNT) {
         return SPIPROXY_EINVAL;
     }
     /* build packet: {id, 0xff, len_le} + payload + crc16 */
@@ -851,9 +857,9 @@ static void exec_item(qitem_t *it)
         return;
     }
     case SPIPROXY_TRACE: {
-        unsigned start = g.ring_w > 64 ? g.ring_w - 64 : 0, w;
+        unsigned start = g.ring_w > TRACE_TAIL_MAX ? g.ring_w - TRACE_TAIL_MAX : 0, w;
         len = 0;
-        for (w = start; w < g.ring_w && len < (int)sizeof(txt) - 64; w++) {
+        for (w = start; w < g.ring_w && len < (int)sizeof(txt) - TRACE_LINE_MAX; w++) {
             trace_ent_t *e = &g.ring[w % TRACE_RING];
             len += snprintf(txt + len, sizeof(txt) - len,
                             "%llu c%u %c %u %02x %04x %08x\n",
