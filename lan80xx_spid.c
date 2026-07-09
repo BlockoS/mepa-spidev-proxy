@@ -35,6 +35,7 @@
 
 #include "spiproxy.h"
 #include "lan80xx_regs.h"
+#include "log.h"
 
 #define MAX_CLIENTS    16
 #define MAX_QITEMS     256
@@ -156,20 +157,6 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * USEC_PER_SEC + ts.tv_nsec / 1000;
 }
 
-static void log_line(const char *fmt, ...)
-{
-    va_list ap;
-
-    if (g.log == NULL) {
-        return;
-    }
-    fprintf(g.log, "%llu ", (unsigned long long)now_us());
-    va_start(ap, fmt);
-    vfprintf(g.log, fmt, ap);
-    va_end(ap);
-    fputc('\n', g.log);
-}
-
 static void warn_line(const char *fmt, ...)
 {
     va_list ap;
@@ -179,8 +166,7 @@ static void warn_line(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     g.n_warns++;
-    log_line("WARN %s", buf);
-    fprintf(stderr, "WARN %s\n", buf);
+    log_warn("%s", buf);
 }
 
 static const char *type_name(uint8_t t)
@@ -461,7 +447,7 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
     }
     if (g.log != NULL) {
         char nb[REG_NAME_BUF];
-        log_line("C%u(%s) seq=%u OP%s%s %c s%u %02x %04x = %08x%s%s",
+        log_debug("C%u(%s) seq=%u OP%s%s %c s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq,
                  g.lctx.tag[0] ? " " : "", g.lctx.tag,
                  op->write ? 'W' : 'R', op->slice, op->mmd, op->reg,
@@ -479,7 +465,7 @@ static int mb_rd(uint8_t slice, uint16_t reg, uint32_t *val)
     int rc = spi_read_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
         char nb[REG_NAME_BUF];
-        log_line("C%u(%s) seq=%u OP mb R s%u %02x %04x = %08x%s%s",
+        log_debug("C%u(%s) seq=%u OP mb R s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
                  reg, *val, reg_name(LAN80XX_MMD_GLOBAL, reg, *val, 0, nb),
                  rc ? " IO-ERR" : "");
@@ -492,7 +478,7 @@ static int mb_wr(uint8_t slice, uint16_t reg, uint32_t val)
     int rc = spi_write_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
         char nb[REG_NAME_BUF];
-        log_line("C%u(%s) seq=%u OP mb W s%u %02x %04x = %08x%s%s",
+        log_debug("C%u(%s) seq=%u OP mb W s%u %02x %04x = %08x%s%s",
                  g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
                  reg, val, reg_name(LAN80XX_MMD_GLOBAL, reg, val, 1, nb),
                  rc ? " IO-ERR" : "");
@@ -645,27 +631,34 @@ static void send_resp(client_t *c, const struct spiproxy_hdr *req,
     if (send(c->fd, msg, sizeof(*h) + blen, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
         c->n_err++;
     }
-    log_line("C%u(%s) seq=%u RSP %s st=%s len=%u", c->id, c->comm, req->seq,
+    log_debug("C%u(%s) seq=%u RSP %s st=%s len=%u", c->id, c->comm, req->seq,
              type_name(req->type), status_name(status), blen);
 }
 
 static void claim_end(int abnormal)
 {
-    int i;
+    uint32_t id;
+    const char *comm;
 
-    log_line("C%u(%s) CLAIM end %s%s",
-             g.claim_owner ? g.claim_owner->id : 0,
-             g.claim_owner ? g.claim_owner->comm : "?",
+    if (g.claim_owner) {
+        id = g.claim_owner->id;
+        comm = g.claim_owner->comm;
+    } else {
+        id = 0;
+        comm = "?";
+    }
+
+    log_debug("C%u(%s) CLAIM end %s%s", id, comm,
              abnormal ? "ABNORMAL" : "normal",
              (abnormal && g.claim_ncleanup) ? " (running cleanup ops)" : "");
     if (abnormal && g.claim_ncleanup) {
-        fprintf(stderr, "claim by client %u ended abnormally: running %d cleanup ops\n",
-                g.claim_owner ? g.claim_owner->id : 0, g.claim_ncleanup);
-        g.lctx.cid = g.claim_owner ? g.claim_owner->id : 0;
-        g.lctx.comm = g.claim_owner ? g.claim_owner->comm : "?";
+        log_warn("claim by client %u ended abnormally: running %d cleanup ops",
+                 id, g.claim_ncleanup);
+        g.lctx.cid = id;
+        g.lctx.comm = comm;
         g.lctx.seq = 0;
         g.lctx.tag = "cleanup";
-        for (i = 0; i < g.claim_ncleanup; i++) {
+        for (int i = 0; i < g.claim_ncleanup; i++) {
             exec_op(NULL, &g.claim_cleanup[i]);
         }
         g.lctx.tag = "";
@@ -716,8 +709,8 @@ static int gpio_open_line_by_name(const char *name)
                 if (ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &req) == 0 &&
                     req.fd >= 0) {
                     fd = req.fd;
-                    fprintf(stderr, "reset GPIO '%s' = %s line %u\n",
-                            name, ci.name, off);
+                    log_always("reset GPIO '%s' = %s line %u",
+                               name, ci.name, off);
                 }
                 break;
             }
@@ -725,7 +718,7 @@ static int gpio_open_line_by_name(const char *name)
         close(chip);
     }
     if (fd < 0)
-        fprintf(stderr, "reset GPIO '%s' not found on any gpiochip\n", name);
+        log_error("reset GPIO '%s' not found on any gpiochip", name);
     return fd;
 }
 
@@ -797,7 +790,7 @@ static void exec_item(qitem_t *it)
             return;
         }
         g.claim_owner = c;
-        log_line("C%u(%s) seq=%u CLAIM grant max_ms=%u ncleanup=%u", c->id,
+        log_debug("C%u(%s) seq=%u CLAIM grant max_ms=%u ncleanup=%u", c->id,
                  c->comm, h->seq, cl->max_ms, cl->ncleanup);
         g.claim_deadline = now_us() + (uint64_t)cl->max_ms * 1000;
         g.claim_ncleanup = cl->ncleanup;
@@ -886,7 +879,7 @@ static void exec_item(qitem_t *it)
          */
         g.mb_inflight = 0;
         gpio_pulse_reset(a, d);
-        log_line("C%u(%s) seq=%u RESET hw assert=%uus deassert=%uus", c->id,
+        log_debug("C%u(%s) seq=%u RESET hw assert=%uus deassert=%uus", c->id,
                  c->comm, h->seq, a, d);
         send_resp(c, h, SPIPROXY_OK, NULL, 0);
         return;
@@ -957,7 +950,7 @@ static void enqueue(client_t *c, struct spiproxy_hdr *h, uint8_t *body)
     it->next = NULL;
     it->c = c;
     it->hdr = *h;
-    log_line("C%u(%s) seq=%u REQ %s prio=%u len=%u", c->id, c->comm, h->seq,
+    log_debug("C%u(%s) seq=%u REQ %s prio=%u len=%u", c->id, c->comm, h->seq,
              type_name(h->type), h->flags & 3, h->len);
     memcpy(it->body, body, h->len);
     if (g.qt[q]) {
@@ -997,7 +990,7 @@ static void client_drop(client_t *c)
     epoll_ctl(g.ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     c->used = 0;
-    log_line("C%u(%s) EVT disconnect", c->id, c->comm);
+    log_debug("C%u(%s) EVT disconnect", c->id, c->comm);
 }
 
 static void client_msg(client_t *c)
@@ -1055,8 +1048,8 @@ static void accept_client(void)
     }
     ev.data.ptr = &g.cl[i];
     epoll_ctl(g.ep_fd, EPOLL_CTL_ADD, fd, &ev);
-    fprintf(stderr, "client %u connected (pid %d)\n", g.cl[i].id, (int)uc.pid);
-    log_line("C%u(%s) EVT connect pid=%d", g.cl[i].id, g.cl[i].comm, (int)uc.pid);
+    log_always("client %u connected (pid %d)", g.cl[i].id, (int)uc.pid);
+    log_debug("C%u(%s) EVT connect pid=%d", g.cl[i].id, g.cl[i].comm, (int)uc.pid);
 }
 
 static void usage(const char *p)
@@ -1098,7 +1091,6 @@ int main(int argc, char **argv)
                 perror(optarg);
                 return 1;
             }
-            setvbuf(g.log, NULL, _IOLBF, 0);
             break;
         default: usage(argv[0]); return 1;
         }
@@ -1108,20 +1100,21 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 1;
     }
+    log_open("lan80xx-spid", g.log);
     if ((g.spi_fd = open(g.dev, O_RDWR)) < 0) {
-        perror(g.dev);
+        log_error("%s: %s", g.dev, strerror(errno));
         return 1;
     }
     if (flock(g.spi_fd, LOCK_EX | LOCK_NB)) {
-        fprintf(stderr, "%s: already locked (another owner?)\n", g.dev);
+        log_error("%s: already locked (another owner?)", g.dev);
         return 1;
     }
     ioctl(g.spi_fd, SPI_IOC_WR_MODE, &mode);
     /* startup sanity: DEVICE_ID must answer on slice 0 */
     if (spi_read_reg(0, LAN80XX_MMD_GLOBAL, LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG, &id) || (id & 0xff00) != 0x8000) {
-        fprintf(stderr, "warning: DEVICE_ID read %#x -- PHY not answering?\n", id);
+        log_warn("DEVICE_ID read %#x -- PHY not answering?", id);
     } else {
-        fprintf(stderr, "%s: LAN80xx DEVICE_ID %#06x\n", g.dev, id);
+        log_always("%s: LAN80xx DEVICE_ID %#06x", g.dev, id);
     }
 
     /* Optional HW reset line (-r <line-name>): enables SPIPROXY_RESET. */
@@ -1133,7 +1126,7 @@ int main(int argc, char **argv)
     g.srv_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (bind(g.srv_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
         listen(g.srv_fd, 8)) {
-        perror(g.sock);
+        log_error("%s: %s", g.sock, strerror(errno));
         return 1;
     }
     g.ep_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -1146,8 +1139,8 @@ int main(int argc, char **argv)
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
-    fprintf(stderr, "lan80xx-spid: %s @%d Hz pad %d, socket %s\n",
-            g.dev, g.freq, g.pad, g.sock);
+    log_always("lan80xx-spid: %s @%d Hz pad %d, socket %s",
+               g.dev, g.freq, g.pad, g.sock);
 
     while (!g.stop) {
         int timeout = g.n_queued ? 0 : (g.claim_owner ? 100 : -1);
@@ -1160,13 +1153,14 @@ int main(int argc, char **argv)
             }
         }
         if (g.claim_owner && now_us() > g.claim_deadline) {
-            fprintf(stderr, "claim by client %u expired\n", g.claim_owner->id);
-            log_line("C%u CLAIM expired", g.claim_owner->id);
+            log_warn("claim by client %u expired", g.claim_owner->id);
+            log_debug("C%u CLAIM expired", g.claim_owner->id);
             claim_end(1);
         }
         drain_queues(64);
     }
     unlink(g.sock);
-    fprintf(stderr, "lan80xx-spid: exit\n");
+    log_always("lan80xx-spid: exit");
+    log_close();
     return 0;
 }
