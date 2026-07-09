@@ -10,6 +10,8 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+add_compile_options(-Wall -Wextra -Wshadow)
+
 option(SPIPROXY_STATIC "Link the executables statically" OFF)
 
 # development package: the wire-protocol API/contract
