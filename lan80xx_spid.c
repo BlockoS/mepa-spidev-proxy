@@ -235,21 +235,15 @@ static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
         const char *side = mmd == LAN80XX_MMD_HOST_PMA ? "HOST" : "LINE";
         if (reg == 0xf0ff) {
             snprintf(buf, REG_NAME_BUF, " %s_PMA8_CMU_FF(page)", side);
-            return buf;
-        }
-        if ((reg & 0xff00) == 0xf000) {
+        } else if ((reg & 0xff00) == 0xf000) {
             snprintf(buf, REG_NAME_BUF, " %s_PMA8_CMU_%02X", side, reg & 0xff);
-            return buf;
-        }
-        if ((reg & 0xff00) == 0xf100) {
+        } else if ((reg & 0xff00) == 0xf100) {
             snprintf(buf, REG_NAME_BUF, " %s_PMA8_LANE_%02X", side, reg & 0xff);
-            return buf;
-        }
-        if (reg == 0x0001) {
+        } else if (reg == 0x0001) {
             snprintf(buf, REG_NAME_BUF, " %s_PMA_STATUS1", side);
-            return buf;
+        } else {
+            snprintf(buf, REG_NAME_BUF, " %s_PMA", side);
         }
-        snprintf(buf, REG_NAME_BUF, " %s_PMA", side);
         return buf;
     }
     if (mmd == LAN80XX_MMD_HOST_PCS) {
