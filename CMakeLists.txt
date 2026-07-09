@@ -10,6 +10,13 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+option(SPIPROXY_STATIC   "Link the executables statically" OFF)
+option(SPIPROXY_SANITIZE "Build with AddressSanitizer + UBSan (dev/CI)" OFF)
+
+if(SPIPROXY_SANITIZE AND SPIPROXY_STATIC)
+    message(FATAL_ERROR "SPIPROXY_SANITIZE and SPIPROXY_STATIC are mutually exclusive")
+endif()
+
 # Default to an optimized build when none is chosen, so _FORTIFY_SOURCE
 # (below) is effective -- it is inert without -O1+.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -21,14 +28,21 @@ add_compile_options(-Wall -Wextra -Wshadow)
 # Hardening: stack canaries on functions with local buffers/arrays.
 add_compile_options(-fstack-protector-strong)
 
-# Fortify libc buffer calls (runtime overflow checks). Only in optimized
-# configs (inert otherwise); -U first so it stays warning-free even when a
-# buildroot/yocto toolchain already defines _FORTIFY_SOURCE.
-add_compile_options(
-    "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE>"
-    "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=2>")
-
-option(SPIPROXY_STATIC "Link the executables statically" OFF)
+# Buffer hardening: the sanitizers (dev/CI) or _FORTIFY_SOURCE (otherwise),
+# never both -- ASan supersedes fortify and combining the two warns.
+if(SPIPROXY_SANITIZE)
+    # ASan + UBSan, aborting on the first error.
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
+                        -fno-sanitize-recover=all)
+    add_link_options(-fsanitize=address,undefined)
+else()
+    # Fortify libc buffer calls in optimized configs (inert otherwise); -U
+    # first so it stays warning-free even when a buildroot/yocto toolchain
+    # already defines _FORTIFY_SOURCE.
+    add_compile_options(
+        "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE>"
+        "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=2>")
+endif()
 
 # development package: the wire-protocol API/contract
 add_library(spiproxy INTERFACE)
