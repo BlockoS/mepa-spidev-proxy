@@ -24,6 +24,7 @@
 #include <sys/un.h>
 
 #include "spiproxy.h"
+#include "lan80xx_regs.h"
 
 static int sock_fd = -1;
 static uint32_t seq;
@@ -143,7 +144,8 @@ int main(int argc, char **argv)
         int n = atoi(argv[1]), i;
         uint32_t *lat = calloc(n, sizeof(*lat));
         uint64_t t;
-        op.mmd = 0x1e; /* DEVICE_ID */
+        op.mmd = LAN80XX_MMD_GLOBAL;
+        op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
         for (i = -50; i < n; i++) {
             t = now_us();
             rlen = sizeof(op);
@@ -164,7 +166,8 @@ int main(int argc, char **argv)
     if (!strcmp(argv[0], "hammer") && argc == 2) {
         uint64_t t_end = now_us() + (uint64_t)atoi(argv[1]) * 1000000;
         uint64_t cnt = 0;
-        op.mmd = 0x1e;
+        op.mmd = LAN80XX_MMD_GLOBAL;
+        op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
         while (now_us() < t_end) {
             rlen = sizeof(op);
             if (xfer(SPIPROXY_READ, SPIPROXY_PRIO_LOW, &op, sizeof(op),
@@ -190,14 +193,17 @@ int main(int argc, char **argv)
         } __attribute__((packed)) req = {
             .cl = { .max_ms = (uint32_t)atoi(argv[1]), .ncleanup = 1 },
             /* harmless marker cleanup op: read DEVICE_ID */
-            .cleanup = { { .slice = 0, .write = 0, .mmd = 0x1e, .reg = 0 } },
+            .cleanup = { { .slice = 0, .write = 0,
+                           .mmd = LAN80XX_MMD_GLOBAL,
+                           .reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG } },
         };
         st = xfer(SPIPROXY_CLAIM, 0, &req, sizeof(req), NULL, NULL);
         printf("claim: status=%d\n", st);
         if (st != SPIPROXY_OK) {
             return 1;
         }
-        op.mmd = 0x1e;
+        op.mmd = LAN80XX_MMD_GLOBAL;
+        op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
         rlen = sizeof(op);
         st = xfer(SPIPROXY_READ, 0, &op, sizeof(op), &op, &rlen);
         printf("read under claim: status=%d val=0x%08x\n", st, op.val);
