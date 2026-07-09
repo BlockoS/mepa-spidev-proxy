@@ -18,6 +18,9 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wshadow)
 
+# Hardening: stack canaries on functions with local buffers/arrays.
+add_compile_options(-fstack-protector-strong)
+
 # Fortify libc buffer calls (runtime overflow checks). Only in optimized
 # configs (inert otherwise); -U first so it stays warning-free even when a
 # buildroot/yocto toolchain already defines _FORTIFY_SOURCE.
