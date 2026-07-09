@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -33,16 +34,22 @@
 #include <linux/gpio.h>
 
 #include "spiproxy.h"
+#include "lan80xx_regs.h"
 
 #define MAX_CLIENTS    16
 #define MAX_QITEMS     256
 #define TRACE_RING     1024
+#define USEC_PER_SEC   1000000u
 #define SPI_BYTES      7        /* 3 address + 4 data                    */
 #define SPI_PAD_MAX    15
+#define SPI_BUF_MAX    (SPI_BYTES + SPI_PAD_MAX) /* tx/rx buffer size     */
+#define SPI_WRITE_FLAG   0x80u  /* byte0 bit7: 1 = write                  */
+#define SPI_ADDR_HI_MASK 0x7fu  /* valid bits of the top address byte     */
+#define SPI_SLICE_SHIFT  21     /* 23-bit addr = slice<<21 | mmd<<16 | reg */
+#define SPI_MMD_SHIFT    16
+#define SPI_CS_DELAY_SCK 2      /* thd;ssn: CS-high >= 2 SCK periods       */
 #define RST_ASSERT_US    10000  /* default HW-reset assert  (10 ms)      */
 #define RST_DEASSERT_US  100000 /* default HW-reset settle  (100 ms)     */
-#define DEVID_MMD      0x1e
-#define DEVID_REG      0x0000
 
 /* MCU mailbox (MMD 0x1e) */
 #define MB_CMD_ADDR    0xd800
@@ -60,12 +67,14 @@
 #define MB_CRC_LEN     2
 #define MB_TIMEOUT_MS  500
 
+#define COMM_PATH_MAX (20U)
+
 typedef struct client {
     int      fd;
     int      used;
     uint32_t id;
     pid_t    pid;
-    char     comm[20];   /* /proc/<pid>/comm of the client process */
+    char     comm[COMM_PATH_MAX];   /* /proc/<pid>/comm of the client process */
     uint64_t n_ops, n_msgs, n_err;
 } client_t;
 
@@ -120,13 +129,13 @@ static struct {
         const char *tag;    /* "", "mb", "cleanup", ...              */
     } lctx;
     /* lint state: cross-client hazard detectors (see lint_op()) */
-    struct { uint32_t cid; char comm[20]; } page_owner[4][2];
-    struct { uint32_t cid; char comm[20]; uint64_t ts; } cor_last[2];
+    struct { uint32_t cid; char comm[COMM_PATH_MAX]; } page_owner[4][2];
+    struct { uint32_t cid; char comm[COMM_PATH_MAX]; uint64_t ts; } cor_last[2];
     struct {
         uint8_t  slice, mmd;
         uint16_t reg;
         uint32_t cid;
-        char     comm[20];
+        char     comm[COMM_PATH_MAX];
         uint64_t ts;
     } rd_ring[16];
     unsigned rd_w;
@@ -138,10 +147,9 @@ static uint64_t now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+    return (uint64_t)ts.tv_sec * USEC_PER_SEC + ts.tv_nsec / 1000;
 }
 
-#include <stdarg.h>
 static void log_line(const char *fmt, ...)
 {
     va_list ap;
@@ -193,11 +201,11 @@ static const char *status_name(int st)
 static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
                             int write, char *buf)
 {
-    if (mmd == 0x1e) {
+    if (mmd == LAN80XX_MMD_GLOBAL) {
         switch (reg) {
-        case 0x0000: return " DEVICE_ID";
-        case 0x0002: return " SILICON_REV";
-        case 0x0003: return " FEATURE_FUSES";
+        case LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG:               return " DEVICE_ID";
+        case LAN80XX_MCU_IO_MNGT_MISC_DEVICE_SILICON_REVISION_REG: return " SILICON_REV";
+        case LAN80XX_MCU_IO_MNGT_MISC_DEVICE_FEATURE_DISABLE_REG:  return " FEATURE_FUSES";
         case MB_MCU_MASK: return " MB_MCU_INT_MASK";
         case MB_MCU_MASK + 1: return " MB_HOST_INT_MASK";
         case MB_FLAG:
@@ -217,8 +225,8 @@ static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
         }
         return " GLOBAL";
     }
-    if (mmd == 0x09 || mmd == 0x01) { /* HOST_PMA / LINE_PMA */
-        const char *side = mmd == 0x09 ? "HOST" : "LINE";
+    if (mmd == LAN80XX_MMD_HOST_PMA || mmd == LAN80XX_MMD_LINE_PMA) {
+        const char *side = mmd == LAN80XX_MMD_HOST_PMA ? "HOST" : "LINE";
         if (reg == 0xf0ff) {
             sprintf(buf, " %s_PMA8_CMU_FF(page)", side);
             return buf;
@@ -238,18 +246,18 @@ static const char *reg_name(uint8_t mmd, uint16_t reg, uint32_t val,
         sprintf(buf, " %s_PMA", side);
         return buf;
     }
-    if (mmd == 0x0b) {
+    if (mmd == LAN80XX_MMD_HOST_PCS) {
         switch (reg) {
-        case 0x0001: return " HOST_PCS_STATUS1";
-        case 0x0020: return " HOST_BASER_STATUS1";
-        case 0x0021: return " HOST_BASER_STATUS2(CoR)";
+        case LAN80XX_HOST_PCS25G_STATUS1:       return " HOST_PCS_STATUS1";
+        case LAN80XX_HOST_PCS25G_BASER_STATUS1: return " HOST_BASER_STATUS1";
+        case LAN80XX_HOST_PCS25G_BASER_STATUS2: return " HOST_BASER_STATUS2(CoR)";
         }
         return " HOST_PCS25G";
     }
-    if (mmd == 0x03) {
-        return reg == 0x0001 ? " LINE_PCS_STATUS1" : " LINE_PCS";
+    if (mmd == LAN80XX_MMD_MAC_LINE_PCS) {
+        return reg == LAN80XX_LINE_PCS25G_STATUS1 ? " LINE_PCS_STATUS1" : " LINE_PCS";
     }
-    if (mmd == 0x07) {
+    if (mmd == LAN80XX_MMD_LINE_KR) {
         return " AN";
     }
     buf[0] = 0;
@@ -270,8 +278,9 @@ static void on_sig(int sig)
  */
 static void spi_fill(uint8_t *tx, int write, uint32_t addr, uint32_t val)
 {
-    memset(tx, 0xff, SPI_BYTES + SPI_PAD_MAX);
-    tx[0] = (uint8_t)((write ? 0x80 : 0) | ((addr >> 16) & 0x7f));
+    memset(tx, 0xff, SPI_BUF_MAX);
+    tx[0] = (uint8_t)((write ? SPI_WRITE_FLAG : 0u) |
+                      ((addr >> 16) & SPI_ADDR_HI_MASK));
     tx[1] = (uint8_t)(addr >> 8);
     tx[2] = (uint8_t)addr;
     if (write) {
@@ -282,14 +291,21 @@ static void spi_fill(uint8_t *tx, int write, uint32_t addr, uint32_t val)
     }
 }
 
+/* Compose the 23-bit SPI address: slice<<21 | mmd<<16 | reg. */
+static uint32_t spi_addr(uint8_t slice, uint8_t mmd, uint16_t reg)
+{
+    return (uint32_t)slice << SPI_SLICE_SHIFT |
+           (uint32_t)mmd   << SPI_MMD_SHIFT   | reg;
+}
+
 static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
 {
-    uint8_t tx[SPI_BYTES + SPI_PAD_MAX], rx[sizeof(tx)];
+    uint8_t tx[SPI_BUF_MAX], rx[SPI_BUF_MAX];
     struct spi_ioc_transfer tr = {
         .tx_buf = (unsigned long)tx, .rx_buf = (unsigned long)rx,
         .len = SPI_BYTES, .speed_hz = g.freq, .bits_per_word = 8,
     };
-    spi_fill(tx, 1, (uint32_t)slice << 21 | (uint32_t)mmd << 16 | reg, val);
+    spi_fill(tx, 1, spi_addr(slice, mmd, reg), val);
     if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(1), &tr) < 1) {
         g.n_io_err++;
         return -1;
@@ -300,8 +316,8 @@ static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
 
 static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
 {
-    uint8_t tx0[SPI_BYTES + SPI_PAD_MAX], rx0[sizeof(tx0)];
-    uint8_t tx1[sizeof(tx0)], rx1[sizeof(tx0)];
+    uint8_t tx0[SPI_BUF_MAX], rx0[SPI_BUF_MAX];
+    uint8_t tx1[SPI_BUF_MAX], rx1[SPI_BUF_MAX];
     /* thd;ssn (DS00006161 Table 4-23) = SCK period + 12 ns: the CS
      * high time between the two frames scales with the clock period,
      * or the chip misses the frame boundary and streams (the response
@@ -311,13 +327,14 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
         { .tx_buf = (unsigned long)tx0, .rx_buf = (unsigned long)rx0,
           .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
           .bits_per_word = 8, .cs_change = 1,
-          .delay_usecs = (uint16_t)(2000000 / g.freq + 1) },
+          .delay_usecs = (uint16_t)(SPI_CS_DELAY_SCK * USEC_PER_SEC / g.freq + 1) },
         { .tx_buf = (unsigned long)tx1, .rx_buf = (unsigned long)rx1,
           .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
           .bits_per_word = 8 },
     };
-    spi_fill(tx0, 0, (uint32_t)slice << 21 | (uint32_t)mmd << 16 | reg, 0);
-    spi_fill(tx1, 0, (uint32_t)slice << 21 | DEVID_MMD << 16 | DEVID_REG, 0);
+    spi_fill(tx0, 0, spi_addr(slice, mmd, reg), 0);
+    spi_fill(tx1, 0, spi_addr(slice, LAN80XX_MMD_GLOBAL,
+                              LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG), 0);
     if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(2), tr) < 1) {
         g.n_io_err++;
         return -1;
@@ -353,13 +370,14 @@ static void trace_add(client_t *c, const struct spiproxy_op *op)
  *  - rmw-race:   B writes a register that A read < 10 ms ago and has
  *    not written back yet -- A's read-modify-write is likely torn.
  */
-#define LINT_COR_WINDOW_US (120ULL * 1000000)
+#define LINT_COR_WINDOW_US (120ULL * USEC_PER_SEC)
 #define LINT_RMW_WINDOW_US (10ULL * 1000)
 
 static void lint_op(const struct spiproxy_op *op)
 {
     uint64_t now = now_us();
-    int side = op->mmd == 0x09 ? 0 : op->mmd == 0x01 ? 1 : -1;
+    int side = op->mmd == LAN80XX_MMD_HOST_PMA ? 0 :
+               op->mmd == LAN80XX_MMD_LINE_PMA ? 1 : -1;
     unsigned i;
 
     /* page-ride + page-owner tracking (HOST=0x09 / LINE=0x01 PMA8) */
@@ -379,14 +397,14 @@ static void lint_op(const struct spiproxy_op *op)
         }
     }
     /* cor-poach (0x0b:0x21 host / 0x03:0x21 line BASER status2) */
-    if (!op->write && op->reg == 0x0021 &&
-        (op->mmd == 0x0b || op->mmd == 0x03)) {
-        int k = op->mmd == 0x0b ? 0 : 1;
+    if (!op->write && op->reg == LAN80XX_HOST_PCS25G_BASER_STATUS2 &&
+        (op->mmd == LAN80XX_MMD_HOST_PCS || op->mmd == LAN80XX_MMD_MAC_LINE_PCS)) {
+        int k = op->mmd == LAN80XX_MMD_HOST_PCS ? 0 : 1;
         if (g.cor_last[k].cid != 0 && g.cor_last[k].cid != g.lctx.cid &&
             now - g.cor_last[k].ts < LINT_COR_WINDOW_US) {
             warn_line("cor-poach: C%u(%s) R s%u %02x 0021 %llus after C%u(%s) (counters consumed)",
                       g.lctx.cid, g.lctx.comm, op->slice, op->mmd,
-                      (unsigned long long)((now - g.cor_last[k].ts) / 1000000),
+                      (unsigned long long)((now - g.cor_last[k].ts) / USEC_PER_SEC),
                       g.cor_last[k].cid, g.cor_last[k].comm);
         }
         g.cor_last[k].cid = g.lctx.cid;
@@ -430,7 +448,7 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
     if (op->slice > 3) {
         return SPIPROXY_EINVAL;
     }
-    if (g.mb_inflight && op->mmd == DEVID_MMD &&
+    if (g.mb_inflight && op->mmd == LAN80XX_MMD_GLOBAL &&
         op->reg >= MB_GUARD_LO && op->reg <= MB_GUARD_HI &&
         c != NULL) {
         return SPIPROXY_EBUSY; /* mailbox region while a MB tx is in flight */
@@ -458,12 +476,12 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
  */
 static int mb_rd(uint8_t slice, uint16_t reg, uint32_t *val)
 {
-    int rc = spi_read_reg(slice, DEVID_MMD, reg, val);
+    int rc = spi_read_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
         char nb[24];
         log_line("C%u(%s) seq=%u OP mb R s%u %02x %04x = %08x%s%s",
-                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, DEVID_MMD,
-                 reg, *val, reg_name(DEVID_MMD, reg, *val, 0, nb),
+                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
+                 reg, *val, reg_name(LAN80XX_MMD_GLOBAL, reg, *val, 0, nb),
                  rc ? " IO-ERR" : "");
     }
     return rc;
@@ -471,12 +489,12 @@ static int mb_rd(uint8_t slice, uint16_t reg, uint32_t *val)
 
 static int mb_wr(uint8_t slice, uint16_t reg, uint32_t val)
 {
-    int rc = spi_write_reg(slice, DEVID_MMD, reg, val);
+    int rc = spi_write_reg(slice, LAN80XX_MMD_GLOBAL, reg, val);
     if (g.log != NULL) {
         char nb[24];
         log_line("C%u(%s) seq=%u OP mb W s%u %02x %04x = %08x%s%s",
-                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, DEVID_MMD,
-                 reg, val, reg_name(DEVID_MMD, reg, val, 1, nb),
+                 g.lctx.cid, g.lctx.comm, g.lctx.seq, slice, LAN80XX_MMD_GLOBAL,
+                 reg, val, reg_name(LAN80XX_MMD_GLOBAL, reg, val, 1, nb),
                  rc ? " IO-ERR" : "");
     }
     return rc;
@@ -1100,7 +1118,7 @@ int main(int argc, char **argv)
     }
     ioctl(g.spi_fd, SPI_IOC_WR_MODE, &mode);
     /* startup sanity: DEVICE_ID must answer on slice 0 */
-    if (spi_read_reg(0, DEVID_MMD, DEVID_REG, &id) || (id & 0xff00) != 0x8000) {
+    if (spi_read_reg(0, LAN80XX_MMD_GLOBAL, LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG, &id) || (id & 0xff00) != 0x8000) {
         fprintf(stderr, "warning: DEVICE_ID read %#x -- PHY not answering?\n", id);
     } else {
         fprintf(stderr, "%s: LAN80xx DEVICE_ID %#06x\n", g.dev, id);
