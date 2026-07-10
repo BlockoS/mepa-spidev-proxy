@@ -13,6 +13,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(SPIPROXY_STATIC   "Link the executables statically" OFF)
 option(SPIPROXY_SANITIZE "Build with AddressSanitizer + UBSan (dev/CI)" OFF)
 option(SPIPROXY_FUZZ     "Build the libFuzzer request-parser harness (needs clang)" OFF)
+option(SPIPROXY_FUZZ_COVERAGE "Add clang source-coverage + a fuzz_coverage report target" OFF)
 
 if(SPIPROXY_STATIC AND (SPIPROXY_SANITIZE OR SPIPROXY_FUZZ))
     message(FATAL_ERROR "SPIPROXY_STATIC is incompatible with SPIPROXY_SANITIZE / SPIPROXY_FUZZ")
@@ -75,6 +76,39 @@ if(SPIPROXY_FUZZ)
         -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
         -Wno-unused-function)
     target_link_options(fuzz_msg PRIVATE -fsanitize=fuzzer,address,undefined)
+
+    # Optional: clang source-based coverage. `fuzz_coverage` replays the
+    # corpus through the harness and prints an llvm-cov report for the parser.
+    if(SPIPROXY_FUZZ_COVERAGE)
+        find_program(LLVM_PROFDATA NAMES llvm-profdata llvm-profdata-21
+                     llvm-profdata-20 llvm-profdata-19 llvm-profdata-18)
+        find_program(LLVM_COV NAMES llvm-cov llvm-cov-21 llvm-cov-20
+                     llvm-cov-19 llvm-cov-18)
+        if(NOT LLVM_PROFDATA OR NOT LLVM_COV)
+            message(FATAL_ERROR
+                "SPIPROXY_FUZZ_COVERAGE needs llvm-profdata and llvm-cov")
+        endif()
+        target_compile_options(fuzz_msg PRIVATE
+            -fprofile-instr-generate -fcoverage-mapping)
+        target_link_options(fuzz_msg PRIVATE -fprofile-instr-generate)
+        set(SPIPROXY_FUZZ_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus"
+            CACHE PATH "Corpus directory to replay for the coverage report")
+        add_custom_target(fuzz_coverage
+            COMMAND ${CMAKE_COMMAND} -E env
+                    ASAN_OPTIONS=symbolize=0 UBSAN_OPTIONS=symbolize=0
+                    LLVM_PROFILE_FILE=fuzz_msg.profraw
+                    $<TARGET_FILE:fuzz_msg> -runs=0 -print_funcs=0
+                    "${SPIPROXY_FUZZ_CORPUS}"
+            COMMAND ${LLVM_PROFDATA} merge -sparse fuzz_msg.profraw
+                    -o fuzz_msg.profdata
+            COMMAND ${LLVM_COV} report $<TARGET_FILE:fuzz_msg>
+                    -instr-profile=fuzz_msg.profdata
+                    "${CMAKE_CURRENT_SOURCE_DIR}/lan80xx_spid.c"
+            DEPENDS fuzz_msg
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            USES_TERMINAL VERBATIM
+            COMMENT "Replaying corpus + llvm-cov report for lan80xx_spid.c")
+    endif()
 endif()
 
 if (SPIPROXY_STATIC)

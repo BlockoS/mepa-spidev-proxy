@@ -38,6 +38,27 @@ target. Disable coverage symbolization as above (`-print_funcs=0` plus
 `llvm-symbolizer`. (Crash reports are still symbolized on demand from the
 saved reproducer.)
 
+## Coverage report
+
+Configure with the coverage option (clang) and build the `fuzz_coverage`
+target: it replays a corpus through the harness and prints an llvm-cov
+report for the parser.
+
+    cmake -S . -B build/cov -DSPIPROXY_FUZZ=ON -DSPIPROXY_FUZZ_COVERAGE=ON \
+        -DCMAKE_C_COMPILER=clang -DSPIPROXY_FUZZ_CORPUS=/path/to/corpus
+    cmake --build build/cov --target fuzz_coverage
+
+`SPIPROXY_FUZZ_CORPUS` defaults to `fuzz/corpus`; point it at a corpus grown
+by a real run for a meaningful number. Only the parser subtree the harness
+reaches is instrumented-and-hit -- `main`/epoll/gpio/real-SPI are compiled
+out under `-DSPIPROXY_FUZZ`, so roughly half of lan80xx_spid.c reads as
+uncovered by design.
+
+For an annotated line-by-line view instead of the summary:
+
+    llvm-cov show build/cov/fuzz_msg \
+        -instr-profile=build/cov/fuzz_msg.profdata lan80xx_spid.c
+
 ## Scope and next steps
 
 - **Single message per input.** Feed a length-prefixed sequence to exercise
