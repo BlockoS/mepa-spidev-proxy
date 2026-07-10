@@ -55,10 +55,10 @@ install(FILES spiproxy.h
 install(TARGETS spiproxy EXPORT mepa_spidev_proxyTargets)
 
 # the spi proxy daemon + debug CLI
-add_executable(lan80xx_spid lan80xx_spid.c log.c)
+add_executable(lan80xx_spid lan80xx_spid.c log.c parse.c)
 set_target_properties(lan80xx_spid PROPERTIES OUTPUT_NAME "lan80xx-spid")
 
-add_executable(spiproxy_cli spiproxy_cli.c)
+add_executable(spiproxy_cli spiproxy_cli.c parse.c)
 set_target_properties(spiproxy_cli PROPERTIES OUTPUT_NAME "spiproxy-cli")
 
 if (SPIPROXY_STATIC)
