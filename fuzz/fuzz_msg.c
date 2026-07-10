@@ -21,15 +21,18 @@
 // the cross-client lint hazards (page-ride / cor-poach / rmw-race). No
 // sockets, epoll, or hardware.
 //
-// Not covered: client_msg()'s transport framing (bypassed), the mailbox
-// in-flight guard (needs the poll to spin so drain interleaves), and the
-// abnormal-claim cleanup (needs client death / max_ms expiry).
+// After draining, both clients are dropped, exercising the queue purge and --
+// for a claim still held -- the abnormal claim_end() cleanup-op path.
+//
+// Not covered: client_msg()'s transport framing (bypassed here; messages are
+// handed to enqueue() directly).
 
 #include "lan80xx_spid.c"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <syslog.h>
 
 #define FUZZ_NCLIENTS 2
 
@@ -39,8 +42,10 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     (void)argv;
     g.freq = 5000000;   /* nonzero; unused by the stub backend, kept sane */
     g.rst_fd = -1;      /* RESET returns ENOSYS -> no usleep on fuzz input */
+    g.ep_fd = -1;       /* client_drop()'s epoll_ctl() fails harmlessly */
     g.log = NULL;       /* no event-log side output */
     g.lctx.tag = "";
+    setlogmask(0);      /* drop syslog output (perf; keeps the system log clean) */
     return 0;
 }
 
@@ -128,5 +133,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     /* Run the real scheduler: eligibility, priority, claim gating. */
     drain_queues(2 * MAX_QITEMS);
+
+    /* Drop both clients: exercises the queue purge and, when a claim is still
+     * held, the abnormal claim_end() cleanup-op path. */
+    for (i = 0; i < FUZZ_NCLIENTS; i++) {
+        client_drop(&cl[i]);
+    }
     return 0;
 }

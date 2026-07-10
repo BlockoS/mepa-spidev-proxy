@@ -75,6 +75,11 @@
 #define MB_HDR_LEN     4
 #define MB_CRC_LEN     2
 #define MB_TIMEOUT_MS  500
+#ifdef SPIPROXY_FUZZ
+#define MB_POLL_DELAY_US  0u      /* fuzzer: no real backoff (one spin, no HW) */
+#else
+#define MB_POLL_DELAY_US  1000u   /* backoff between response-flag polls       */
+#endif
 
 #define COMM_PATH_MAX (20U)
 #define REG_NAME_BUF   32       /* reg_name() output buffer size          */
@@ -337,12 +342,13 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
 #else   /* SPIPROXY_FUZZ: hardware-free SPI backend, responses fed by fuzzer */
 /* spi_read_reg pulls its result from this fuzzer-supplied feed (set by the
  * harness before draining), so device replies -- mailbox response words,
- * register reads -- are part of the fuzz input. MB_FLAG is the one exception:
- * it always reports the response ready so exec_mailbox's poll loop returns at
- * once instead of spinning to its (wall-clock) timeout. */
+ * register reads -- are part of the fuzz input. MB_FLAG is the exception: it
+ * models the MCU handshake (see spi_read_reg) so exec_mailbox terminates after
+ * a single poll pass instead of spinning to its wall-clock timeout. */
 static const uint8_t *g_fuzz_spi;
 static size_t g_fuzz_spi_len;
 static size_t g_fuzz_spi_pos;
+static unsigned g_fuzz_mb_reads;   /* MB_FLAG reads since a tx went in flight */
 
 static uint32_t fuzz_spi_next(void)
 {
@@ -368,9 +374,25 @@ static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
 static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
 {
     (void)slice;
-    *val = (mmd == LAN80XX_MMD_GLOBAL && reg == MB_FLAG)
-         ? MB_F_RESP
-         : fuzz_spi_next();
+    if (mmd == LAN80XX_MMD_GLOBAL && reg == MB_FLAG) {
+        /* Model the MCU flag so exec_mailbox terminates deterministically while
+         * still running one drain_queues() pass with mb_inflight set -- that
+         * pass is what exercises the in-flight guard and foreign-op
+         * interleaving. Before the tx (mb_inflight clear) read not-busy so it
+         * starts; once in flight, read BUSY on the first poll (so it spins once
+         * and drains) then RESP. A nested mailbox arriving during that drain
+         * reads BUSY at its pre-check and is rejected, so the handler stays
+         * non-reentrant, as on hardware. */
+        if (!g.mb_inflight) {
+            g_fuzz_mb_reads = 0;
+            *val = 0;
+        } else {
+            g_fuzz_mb_reads++;
+            *val = MB_F_BUSY | (g_fuzz_mb_reads >= 2 ? MB_F_RESP : 0);
+        }
+    } else {
+        *val = fuzz_spi_next();
+    }
     g.n_reads++;
     return 0;
 }
@@ -608,7 +630,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
             return SPIPROXY_ETIMEDOUT;
         }
         drain_queues(4);     /* let foreign non-MB ops through */
-        usleep(1000);
+        usleep(MB_POLL_DELAY_US);
     }
     /* response: word0 = header */
     if (mb_rd(mb->slice, MB_RESP_ADDR, &v)) {

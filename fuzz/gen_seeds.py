@@ -10,9 +10,10 @@ Each file is one fuzz input in the harness format:
 where the spi_feed drives the stub SPI backend (device replies) and each
 framed message is a u16 (top bit = client 0/1, low 15 bits = length) followed
 by a spiproxy_hdr + body. Seeds cover one valid request per command type plus
-a couple of stateful sequences (claim/release, cross-client) and a mailbox
-with a fabricated response, so the fuzzer starts from valid framing and CI has
-a regression set. Layouts mirror spiproxy.h; the harness overrides ver/len.
+stateful sequences (claim/release, cross-client, and a mailbox with a foreign
+op queued behind it that trips the in-flight guard) and a mailbox with a
+fabricated response, so the fuzzer starts from valid framing and CI has a
+regression set. Layouts mirror spiproxy.h; the harness overrides ver/len.
 
 Usage:
     gen_seeds.py <corpus-dir>
@@ -82,6 +83,11 @@ def seeds() -> dict[str, bytes]:
         # stateful sequences (exercise the queue + claim gating)
         "claim_seq":   make([(0, hdr(CLAIM, claim)), (0, hdr(READ, rd)), (0, rel)]),
         "cross_claim": make([(0, hdr(CLAIM, claim)), (1, hdr(READ, rd)), (0, rel)]),
+        # a foreign op to the guarded MB region queued behind a mailbox tx: it
+        # is dispatched during the mailbox poll and hits the in-flight guard.
+        "mb_guard":    make([(0, hdr(MAILBOX, mb)),
+                             (0, hdr(READ, op(0, 0, 0x1E, 0xD800, 0)))],
+                            feed=mb_feed),
     }
 
 

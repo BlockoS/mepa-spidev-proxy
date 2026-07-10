@@ -80,12 +80,15 @@ dir):
   the priority queues, `item_eligible()` claim gating, and the cross-client
   lint hazards (page-ride / cor-poach / rmw-race); the SPI backend returns the
   `spi_feed`, so mailbox response parsing / CRC is driven by the input.
+- **Mailbox in-flight guard + abnormal cleanup.** The stub `MB_FLAG` models
+  the MCU handshake so `exec_mailbox()` runs one `drain_queues()` pass with
+  `mb_inflight` set -- a foreign op to the mailbox region queued behind it
+  then trips the in-flight guard, and a second mailbox is rejected as
+  non-reentrant. After draining, both clients are dropped, covering the
+  abnormal `claim_end()` cleanup-op path.
 - **Transport framing bypassed.** Messages are handed to `enqueue()`
-  directly, so `client_msg()`'s `ver`/`len` checks aren't covered -- add a
-  harness over that layer if wanted.
-- **Still out of reach.** The mailbox in-flight guard (needs the poll to spin
-  so drain interleaves) and the abnormal-claim cleanup (needs client death /
-  max_ms expiry) -- both in the compiled-out transport.
+  directly, so `client_msg()`'s `ver`/`len` checks over `recv()` aren't
+  covered -- add a harness over that layer if wanted.
 - **Depth.** Pair with AFL++ (`afl-clang-lto`, persistent mode + cmplog) to
   crack the header/CRC magic values faster than coverage alone.
 - **CI.** ClusterFuzzLite in GitHub Actions gives short per-PR campaigns.
