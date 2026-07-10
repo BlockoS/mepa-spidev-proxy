@@ -40,7 +40,7 @@ if [ -z "$aflcc" ]; then
 fi
 
 mkdir -p "$out"
-cflags=(-DSPIPROXY_FUZZ -I"$root" -g -O2 -fsanitize=fuzzer)
+cflags=(-DSPIPROXY_FUZZ -I"$root" -g -O2 -fsanitize=fuzzer -fno-sanitize-recover=all)
 srcs=("$root/fuzz/fuzz_msg.c" "$root/log.c" "$root/parse.c")
 
 echo "[afl] compiler: $aflcc"

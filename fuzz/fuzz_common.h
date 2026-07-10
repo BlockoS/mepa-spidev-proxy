@@ -1,0 +1,72 @@
+// Copyright (c) 2026 Vincent Jardin, Vincent Cruz, Free Mobile
+// SPDX-License-Identifier: BSD-4-Clause
+//
+// Shared setup for the lan80xx-spid fuzz harnesses. Include AFTER
+// #include "lan80xx_spid.c" (it uses the daemon's static globals/types).
+// Each harness is its own binary, so the non-static LLVMFuzzerInitialize
+// defined here is linked exactly once.
+
+#ifndef FUZZ_COMMON_H
+#define FUZZ_COMMON_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <syslog.h>
+
+#define FUZZ_NCLIENTS 2
+
+int LLVMFuzzerInitialize(int *argc, char ***argv)
+{
+    (void)argc;
+    (void)argv;
+    g.freq = 5000000;   /* nonzero; unused by the stub backend, kept sane */
+    g.rst_fd = -1;      /* RESET returns ENOSYS -> no usleep on fuzz input */
+    g.ep_fd = -1;       /* client_drop()'s epoll_ctl() fails harmlessly */
+    g.log = NULL;       /* no event-log side output */
+    g.lctx.tag = "";
+    setlogmask(0);      /* drop syslog output (perf; keeps the system log clean) */
+    return 0;
+}
+
+/* Fresh per-input daemon state: dispatch/lint flags, the trace + rmw rings,
+ * and the qitem freelist/queues (rebuilt, not the ~1 MB of bodies). */
+static void fuzz_reset(void)
+{
+    int i;
+
+    g.claim_owner = NULL;
+    g.claim_ncleanup = 0;
+    g.claim_deadline = 0;
+    g.mb_inflight = 0;
+    g.ring_w = 0;
+    g.rd_w = 0;
+    g.n_queued = 0;
+    memset(g.page_owner, 0, sizeof(g.page_owner));
+    memset(g.cor_last, 0, sizeof(g.cor_last));
+    memset(g.rd_ring, 0, sizeof(g.rd_ring));
+    for (i = 0; i < MAX_QITEMS - 1; i++) {
+        g.pool[i].next = &g.pool[i + 1];
+    }
+    g.pool[MAX_QITEMS - 1].next = NULL;
+    g.freel = &g.pool[0];
+    for (i = 0; i < 3; i++) {
+        g.qh[i] = NULL;
+        g.qt[i] = NULL;
+    }
+}
+
+/* FUZZ_NCLIENTS fresh clients (ids 1..N, no socket: fd -1). */
+static void fuzz_clients(client_t *cl)
+{
+    int i;
+
+    for (i = 0; i < FUZZ_NCLIENTS; i++) {
+        memset(&cl[i], 0, sizeof(cl[i]));
+        cl[i].used = 1;
+        cl[i].id = (uint32_t)(i + 1);
+        cl[i].fd = -1;   /* send_resp()'s send() fails harmlessly */
+    }
+}
+
+#endif /* FUZZ_COMMON_H */

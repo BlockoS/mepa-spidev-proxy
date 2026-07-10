@@ -1,18 +1,25 @@
 # Fuzzing lan80xx-spid
 
-`fuzz_msg` is a libFuzzer harness for the request parser — `exec_item()` and
-the read / write / batch / claim / mailbox handlers, the surface that
-consumes untrusted client messages.
+Two libFuzzer harnesses cover the surface that consumes untrusted client
+input:
+- `fuzz_msg` — the request parser: `exec_item()` and the read / write / batch
+  / claim / mailbox handlers, driven through the real `enqueue()` /
+  `drain_queues()` scheduler.
+- `fuzz_frame` — the transport parse: `client_frame()`, the header
+  `ver` / length-vs-bytecount / `SPIPROXY_MSG_MAX` validation a datagram hits
+  before dispatch.
 
-It `#include`s `lan80xx_spid.c` built with `-DSPIPROXY_FUZZ`, which:
+Both `#include` `lan80xx_spid.c` built with `-DSPIPROXY_FUZZ`, which:
 - drops `main()` (libFuzzer provides its own), and
 - swaps the SPI backend (`spi_read_reg`/`spi_write_reg`) for hardware-free
-  deterministic stubs (the mailbox `MB_FLAG` read reports the response
-  ready, so `exec_mailbox()`'s poll loop returns immediately instead of
-  spinning to its timeout).
+  stubs; the mailbox `MB_FLAG` read models the MCU handshake so
+  `exec_mailbox()` runs one poll pass and returns instead of spinning to its
+  timeout.
 
-Sanitizers are the bug oracle; the harness is built with
-`-fsanitize=fuzzer,address,undefined`.
+Shared harness setup lives in `fuzz/fuzz_common.h`. Sanitizers are the bug
+oracle: both are built with `-fsanitize=fuzzer,address,undefined
+-fno-sanitize-recover=all`, so a UB or memory error aborts and is saved as a
+reproducer rather than merely printed.
 
 ## Build (needs clang)
 
@@ -23,6 +30,8 @@ Sanitizers are the bug oracle; the harness is built with
 
     ASAN_OPTIONS=symbolize=0 UBSAN_OPTIONS=symbolize=0 \
         ./build/fuzz/fuzz_msg -print_funcs=0 -max_len=4096 fuzz/corpus
+    ASAN_OPTIONS=symbolize=0 UBSAN_OPTIONS=symbolize=0 \
+        ./build/fuzz/fuzz_frame -print_funcs=0 fuzz/corpus_frame
 
 Seed `corpus/` from real traffic: capture the daemon's `-L` event log while
 driving `spiproxy-cli`, or drop raw request datagrams (`spiproxy_hdr` + body)
@@ -46,9 +55,10 @@ Regenerate with:
 
     python3 fuzz/gen_seeds.py fuzz/corpus
 
-Seeds bootstrap the fuzzer past the framing checks (they hit ~260 edges on
-their own) and double as a CI regression set. Grow the corpus with a real
-run, and minimize it back down with `fuzz_msg -merge=1 fuzz/corpus grown/`.
+That also writes `fuzz/corpus_frame/` (raw datagrams) for `fuzz_frame`. Seeds
+bootstrap the fuzzer past the framing checks and double as a CI regression
+set. Grow the corpus with a real run, and minimize it back down with
+`fuzz_msg -merge=1 fuzz/corpus grown/`.
 
 ## Coverage report
 
@@ -107,9 +117,10 @@ libFuzzer too with `-dict=fuzz/spiproxy.dict`.
   then trips the in-flight guard, and a second mailbox is rejected as
   non-reentrant. After draining, both clients are dropped, covering the
   abnormal `claim_end()` cleanup-op path.
-- **Transport framing bypassed.** Messages are handed to `enqueue()`
-  directly, so `client_msg()`'s `ver`/`len` checks over `recv()` aren't
-  covered -- add a harness over that layer if wanted.
+- **Transport framing.** `fuzz_frame` feeds raw datagrams to `client_frame()`
+  (copied into an aligned buffer, as `recv()` fills one), covering the `ver` /
+  length-mismatch / oversize reject paths. `fuzz_msg` still hands messages to
+  `enqueue()` directly, skipping that layer by design.
 - **Depth.** AFL++ CMPLOG cracks the mailbox CRC / magic-value branches that
   coverage-only mutation stalls on -- see the AFL++ section above.
 - **CI.** ClusterFuzzLite in GitHub Actions gives short per-PR campaigns.

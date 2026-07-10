@@ -14,16 +14,21 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
         "Reconfigure your project with CMAKE_C_COMPILER=clang")
 endif()
 
-# Harness: #includes lan80xx_spid.c (SPIPROXY_FUZZ drops main + stubs the SPI
-# backend). Needs clang for -fsanitize=fuzzer.
-add_executable(fuzz_msg fuzz/fuzz_msg.c log.c parse.c)
-target_include_directories(fuzz_msg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_definitions(fuzz_msg PRIVATE SPIPROXY_FUZZ)
-target_compile_options(fuzz_msg PRIVATE
-    -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-    -Wno-unused-function)
-target_link_options(fuzz_msg PRIVATE -fsanitize=fuzzer,address,undefined)
-set_target_properties(fuzz_msg PROPERTIES FOLDER fuzz)
+# Harnesses: each #includes lan80xx_spid.c (SPIPROXY_FUZZ drops main + stubs
+# the SPI backend). fuzz_msg drives the request handlers through the scheduler;
+# fuzz_frame drives the transport parse (client_frame). Need clang for
+# -fsanitize=fuzzer.
+foreach(harness fuzz_msg fuzz_frame)
+    add_executable(${harness} fuzz/${harness}.c log.c parse.c)
+    target_include_directories(${harness} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${harness} PRIVATE SPIPROXY_FUZZ)
+    target_compile_options(${harness} PRIVATE
+        -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all
+        -fno-omit-frame-pointer -Wno-unused-function)
+    target_link_options(${harness} PRIVATE
+        -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+    set_target_properties(${harness} PROPERTIES FOLDER fuzz)
+endforeach()
 
 # Optional: clang source-based coverage. `fuzz_coverage` replays the corpus
 # through the harness and prints an llvm-cov report for the parser.

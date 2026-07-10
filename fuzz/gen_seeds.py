@@ -15,8 +15,12 @@ op queued behind it that trips the in-flight guard) and a mailbox with a
 fabricated response, so the fuzzer starts from valid framing and CI has a
 regression set. Layouts mirror spiproxy.h; the harness overrides ver/len.
 
+A sibling corpus_frame/ is also written for the fuzz_frame harness: raw
+datagrams (a u16 length prefix + a valid spiproxy_hdr + body) that the fuzzer
+mutates into the transport reject paths (bad ver, length mismatch, oversize).
+
 Usage:
-    gen_seeds.py <corpus-dir>
+    gen_seeds.py <corpus-dir>       # e.g. fuzz/corpus (+ fuzz/corpus_frame)
 """
 
 from __future__ import annotations
@@ -44,6 +48,11 @@ def op(slice_: int, write: int, mmd: int, reg: int, val: int) -> bytes:
 
 def frame(msg: bytes, client: int = 0) -> bytes:
     return struct.pack("<H", ((client & 1) << 15) | (len(msg) & 0x7FFF)) + msg
+
+
+def dgram(datagram: bytes) -> bytes:
+    """u16 length prefix + a raw datagram, for the fuzz_frame harness."""
+    return struct.pack("<H", len(datagram)) + datagram
 
 
 def make(messages: list[tuple[int, bytes]], feed: bytes = b"") -> bytes:
@@ -91,16 +100,32 @@ def seeds() -> dict[str, bytes]:
     }
 
 
+def frame_seeds() -> dict[str, bytes]:
+    """Seeds for fuzz_frame: valid datagrams (hdr() already sets ver/len), which
+    the fuzzer mutates into the ver / length-mismatch / oversize reject paths."""
+    rd = op(0, 0, 0x1E, 0x0000, 0)
+    claim = struct.pack("<IHH", 100, 1, 0) + op(0, 0, 0x1E, 0x0000, 0)
+    return {
+        "read":  dgram(hdr(READ, rd)),
+        "write": dgram(hdr(WRITE, op(0, 1, 0x0B, 0x0021, 0x1234))),
+        "stats": dgram(hdr(STATS, b"")),
+        "claim": dgram(hdr(CLAIM, claim)),
+        # two datagrams back-to-back (the harness alternates clients)
+        "seq":   dgram(hdr(CLAIM, claim)) + dgram(hdr(READ, rd)),
+    }
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         sys.stderr.write(__doc__ or "")
         return 2
+    # fuzz_msg corpus in <dir>, fuzz_frame corpus in the sibling corpus_frame/.
     d = pathlib.Path(argv[1])
-    d.mkdir(parents=True, exist_ok=True)
-    s = seeds()
-    for name, data in s.items():
-        (d / f"{name}.bin").write_bytes(data)
-    sys.stderr.write(f"wrote {len(s)} seeds to {d}\n")
+    for path, table in ((d, seeds()), (d.parent / "corpus_frame", frame_seeds())):
+        path.mkdir(parents=True, exist_ok=True)
+        for name, data in table.items():
+            (path / f"{name}.bin").write_bytes(data)
+        sys.stderr.write(f"wrote {len(table)} seeds to {path}\n")
     return 0
 
 

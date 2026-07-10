@@ -1053,24 +1053,36 @@ static void client_drop(client_t *c)
     log_debug("C%u(%s) EVT disconnect", c->id, c->comm);
 }
 
+/*
+ * Validate one received datagram and enqueue it: header version, the length
+ * field vs the byte count actually received, and the payload bound. Split out
+ * of client_msg() so the transport parse can be exercised without a socket
+ * (see the fuzz harness). msg holds n bytes.
+ */
+static void client_frame(client_t *c, uint8_t *msg, size_t n)
+{
+    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
+
+    if (n < sizeof(*h) || h->ver != SPIPROXY_VER ||
+        h->len != (uint32_t)n - sizeof(*h) || h->len > SPIPROXY_MSG_MAX) {
+        struct spiproxy_hdr bad = { .type = 0, .seq = 0 };
+        send_resp(c, n >= sizeof(*h) ? h : &bad, SPIPROXY_EINVAL, NULL, 0);
+        return;
+    }
+    c->n_msgs++;
+    enqueue(c, h, msg + sizeof(*h));
+}
+
 static void client_msg(client_t *c)
 {
     uint8_t msg[sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX];
-    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
     ssize_t n = recv(c->fd, msg, sizeof(msg), 0);
 
     if (n <= 0) {
         client_drop(c);
         return;
     }
-    if ((size_t)n < sizeof(*h) || h->ver != SPIPROXY_VER ||
-        h->len != (uint32_t)n - sizeof(*h) || h->len > SPIPROXY_MSG_MAX) {
-        struct spiproxy_hdr bad = { .type = 0, .seq = 0 };
-        send_resp(c, (size_t)n >= sizeof(*h) ? h : &bad, SPIPROXY_EINVAL, NULL, 0);
-        return;
-    }
-    c->n_msgs++;
-    enqueue(c, h, msg + sizeof(*h));
+    client_frame(c, msg, (size_t)n);
 }
 
 static void accept_client(void)
