@@ -40,6 +40,37 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
 }
 
+/*
+ * Parse a response datagram (msg holds n received bytes) for the request's
+ * seq/type, copying up to *rlen body bytes into resp. Split out of xfer() so
+ * the response parse can be fuzzed without a socket. Returns the status
+ * (h->flags), or -1 on a short or mismatched response.
+ */
+static int parse_resp(const uint8_t *msg, ssize_t n, uint32_t want_seq,
+                      uint8_t want_type, void *resp, uint32_t *rlen)
+{
+    const struct spiproxy_hdr *h = (const struct spiproxy_hdr *)msg;
+
+    if (n < (ssize_t)sizeof(*h)) {
+        fprintf(stderr, "short response (%zd bytes)\n", n);
+        return -1;
+    }
+    if (h->seq != want_seq || h->type != (want_type | SPIPROXY_RESP)) {
+        fprintf(stderr, "bad response (seq %u type %#x)\n", h->seq, h->type);
+        return -1;
+    }
+    if (resp && rlen) {
+        uint32_t avail = (uint32_t)(n - (ssize_t)sizeof(*h));
+
+        *rlen = h->len < *rlen ? h->len : *rlen;
+        if (*rlen > avail) {
+            *rlen = avail;   /* never copy more than was actually received */
+        }
+        memcpy(resp, msg + sizeof(*h), *rlen);
+    }
+    return h->flags; /* status */
+}
+
 static int xfer(uint8_t type, uint16_t flags, const void *body, uint32_t blen,
                 void *resp, uint32_t *rlen)
 {
@@ -73,19 +104,11 @@ static int xfer(uint8_t type, uint16_t flags, const void *body, uint32_t blen,
         return -1;
     }
     n = recv(sock_fd, msg, sizeof(msg), 0);
-    if (n < (ssize_t)sizeof(*h)) {
+    if (n < 0) {
         perror("recv");
         return -1;
     }
-    if (h->seq != seq || h->type != (type | SPIPROXY_RESP)) {
-        fprintf(stderr, "bad response (seq %u type %#x)\n", h->seq, h->type);
-        return -1;
-    }
-    if (resp && rlen) {
-        *rlen = h->len < *rlen ? h->len : *rlen;
-        memcpy(resp, msg + sizeof(*h), *rlen);
-    }
-    return h->flags; /* status */
+    return parse_resp(msg, n, seq, type, resp, rlen);
 }
 
 static int cmp_u32(const void *a, const void *b)
@@ -93,6 +116,7 @@ static int cmp_u32(const void *a, const void *b)
     return (int)(*(const uint32_t *)a - *(const uint32_t *)b);
 }
 
+#ifndef SPIPROXY_FUZZ
 int main(int argc, char **argv)
 {
     struct spiproxy_op op = { 0 };
@@ -295,3 +319,4 @@ int main(int argc, char **argv)
     fprintf(stderr, "unknown command '%s'\n", argv[0]);
     return EXIT_FAILURE;
 }
+#endif /* SPIPROXY_FUZZ */
