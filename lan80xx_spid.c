@@ -75,6 +75,11 @@
 #define MB_HDR_LEN     4
 #define MB_CRC_LEN     2
 #define MB_TIMEOUT_MS  500
+#ifdef SPIPROXY_FUZZ
+#define MB_POLL_DELAY_US  0u      /* fuzzer: no real backoff (one spin, no HW) */
+#else
+#define MB_POLL_DELAY_US  1000u   /* backoff between response-flag polls       */
+#endif
 
 #define COMM_PATH_MAX (20U)
 #define REG_NAME_BUF   32       /* reg_name() output buffer size          */
@@ -265,6 +270,7 @@ static void on_sig(int sig)
  * out during request N+1, so a logical read is one 2-transfer ioctl
  * (request, then a dummy DEVICE_ID request that collects the data).
  */
+#ifndef SPIPROXY_FUZZ
 static void spi_fill(uint8_t *tx, int write, uint32_t addr, uint32_t val)
 {
     memset(tx, 0xff, SPI_BUF_MAX);
@@ -333,6 +339,74 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
     g.n_reads++;
     return 0;
 }
+#else   /* SPIPROXY_FUZZ: hardware-free SPI backend, responses fed by fuzzer */
+/* spi_read_reg pulls its result from this fuzzer-supplied feed (set by the
+ * harness before draining), so device replies -- mailbox response words,
+ * register reads -- are part of the fuzz input. MB_FLAG is the exception: it
+ * models the MCU handshake (see spi_read_reg) so exec_mailbox terminates after
+ * a single poll pass instead of spinning to its wall-clock timeout. */
+static const uint8_t *g_fuzz_spi;
+static size_t g_fuzz_spi_len;
+static size_t g_fuzz_spi_pos;
+static unsigned g_fuzz_mb_reads;   /* MB_FLAG reads since a tx went in flight */
+
+/* A rare feed word that makes a (non-MB_FLAG) SPI read fail, so the fuzzer can
+ * drive the I/O-error and mailbox-abort cleanup paths. Chosen unlikely so it
+ * never collides with real corpus feed data (keeps the input format stable). */
+#define SPI_FAIL_MAGIC 0xE770FA11u
+
+static uint32_t fuzz_spi_next(void)
+{
+    uint32_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < 4 && g_fuzz_spi_pos < g_fuzz_spi_len; i++) {
+        v |= (uint32_t)g_fuzz_spi[g_fuzz_spi_pos++] << (i * 8);
+    }
+    return v;   /* exhausted feed reads as 0 */
+}
+
+static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
+{
+    (void)slice;
+    (void)mmd;
+    (void)reg;
+    (void)val;
+    g.n_writes++;
+    return 0;
+}
+
+static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
+{
+    (void)slice;
+    if (mmd == LAN80XX_MMD_GLOBAL && reg == MB_FLAG) {
+        /* Model the MCU flag so exec_mailbox terminates deterministically while
+         * still running one drain_queues() pass with mb_inflight set -- that
+         * pass is what exercises the in-flight guard and foreign-op
+         * interleaving. Before the tx (mb_inflight clear) read not-busy so it
+         * starts; once in flight, read BUSY on the first poll (so it spins once
+         * and drains) then RESP. A nested mailbox arriving during that drain
+         * reads BUSY at its pre-check and is rejected, so the handler stays
+         * non-reentrant, as on hardware. */
+        if (!g.mb_inflight) {
+            g_fuzz_mb_reads = 0;
+            *val = 0;
+        } else {
+            g_fuzz_mb_reads++;
+            *val = MB_F_BUSY | (g_fuzz_mb_reads >= 2 ? MB_F_RESP : 0);
+        }
+    } else {
+        uint32_t w = fuzz_spi_next();
+        if (w == SPI_FAIL_MAGIC) {
+            g.n_io_err++;
+            return -1;   /* fuzzer-injected read failure (mirrors a bus error) */
+        }
+        *val = w;
+    }
+    g.n_reads++;
+    return 0;
+}
+#endif  /* SPIPROXY_FUZZ */
 
 static void trace_add(client_t *c, const struct spiproxy_op *op)
 {
@@ -566,7 +640,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
             return SPIPROXY_ETIMEDOUT;
         }
         drain_queues(4);     /* let foreign non-MB ops through */
-        usleep(1000);
+        usleep(MB_POLL_DELAY_US);
     }
     /* response: word0 = header */
     if (mb_rd(mb->slice, MB_RESP_ADDR, &v)) {
@@ -666,6 +740,7 @@ static void claim_end(int abnormal)
     g.claim_deadline = 0;
 }
 
+#ifndef SPIPROXY_FUZZ
 /*
  * Reset GPIO via the kernel GPIO v2 character-device uapi (libc-only,
  * no libgpiod). Resolve the line by NAME (the gpio-line-names entry
@@ -734,6 +809,13 @@ static void gpio_pulse_reset(uint32_t assert_us, uint32_t deassert_us)
     gpio_set(g.rst_fd, 0);
     usleep(deassert_us);
 }
+#else   /* SPIPROXY_FUZZ: hardware-free build, no GPIO reset line / v2 uapi */
+static void gpio_pulse_reset(uint32_t assert_us, uint32_t deassert_us)
+{
+    (void)assert_us;
+    (void)deassert_us;   /* unreachable: RESET is gated on g.rst_fd < 0 */
+}
+#endif  /* SPIPROXY_FUZZ */
 
 static void exec_item(qitem_t *it)
 {
@@ -989,24 +1071,36 @@ static void client_drop(client_t *c)
     log_debug("C%u(%s) EVT disconnect", c->id, c->comm);
 }
 
+/*
+ * Validate one received datagram and enqueue it: header version, the length
+ * field vs the byte count actually received, and the payload bound. Split out
+ * of client_msg() so the transport parse can be exercised without a socket
+ * (see the fuzz harness). msg holds n bytes.
+ */
+static void client_frame(client_t *c, uint8_t *msg, size_t n)
+{
+    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
+
+    if (n < sizeof(*h) || h->ver != SPIPROXY_VER ||
+        h->len != (uint32_t)n - sizeof(*h) || h->len > SPIPROXY_MSG_MAX) {
+        struct spiproxy_hdr bad = { .type = 0, .seq = 0 };
+        send_resp(c, n >= sizeof(*h) ? h : &bad, SPIPROXY_EINVAL, NULL, 0);
+        return;
+    }
+    c->n_msgs++;
+    enqueue(c, h, msg + sizeof(*h));
+}
+
 static void client_msg(client_t *c)
 {
     uint8_t msg[sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX];
-    struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
     ssize_t n = recv(c->fd, msg, sizeof(msg), 0);
 
     if (n <= 0) {
         client_drop(c);
         return;
     }
-    if ((size_t)n < sizeof(*h) || h->ver != SPIPROXY_VER ||
-        h->len != (uint32_t)n - sizeof(*h) || h->len > SPIPROXY_MSG_MAX) {
-        struct spiproxy_hdr bad = { .type = 0, .seq = 0 };
-        send_resp(c, (size_t)n >= sizeof(*h) ? h : &bad, SPIPROXY_EINVAL, NULL, 0);
-        return;
-    }
-    c->n_msgs++;
-    enqueue(c, h, msg + sizeof(*h));
+    client_frame(c, msg, (size_t)n);
 }
 
 static void accept_client(void)
@@ -1063,6 +1157,7 @@ static void usage(const char *p)
             "      claim + client lifecycle\n", p, SPIPROXY_SOCK);
 }
 
+#ifndef SPIPROXY_FUZZ
 int main(int argc, char **argv)
 {
     struct sockaddr_un sa = { .sun_family = AF_UNIX };
@@ -1171,3 +1266,4 @@ int main(int argc, char **argv)
     log_close();
     return EXIT_SUCCESS;
 }
+#endif  /* SPIPROXY_FUZZ */
