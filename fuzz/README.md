@@ -22,7 +22,7 @@ Sanitizers are the bug oracle; the harness is built with
 ## Run
 
     ASAN_OPTIONS=symbolize=0 UBSAN_OPTIONS=symbolize=0 \
-        ./build/fuzz/fuzz_msg -print_funcs=0 -max_len=4096 corpus/
+        ./build/fuzz/fuzz_msg -print_funcs=0 -max_len=4096 fuzz/corpus
 
 Seed `corpus/` from real traffic: capture the daemon's `-L` event log while
 driving `spiproxy-cli`, or drop raw request datagrams (`spiproxy_hdr` + body)
@@ -37,6 +37,18 @@ target. Disable coverage symbolization as above (`-print_funcs=0` plus
 `ASAN_OPTIONS=symbolize=0`), or point `ASAN_SYMBOLIZER_PATH` at a working
 `llvm-symbolizer`. (Crash reports are still symbolized on demand from the
 saved reproducer.)
+
+## Seed corpus
+
+`fuzz/corpus/` ships a small seed set -- one valid request per command type
+(read/write/batch/claim/release/mailbox/stats/trace/reset), ~200 bytes total.
+Regenerate with:
+
+    python3 fuzz/gen_seeds.py fuzz/corpus
+
+Seeds bootstrap the fuzzer past the framing checks (they hit ~260 edges on
+their own) and double as a CI regression set. Grow the corpus with a real
+run, and minimize it back down with `fuzz_msg -merge=1 fuzz/corpus grown/`.
 
 ## Coverage report
 
@@ -54,10 +66,11 @@ reaches is instrumented-and-hit -- `main`/epoll/gpio/real-SPI are compiled
 out under `-DSPIPROXY_FUZZ`, so roughly half of lan80xx_spid.c reads as
 uncovered by design.
 
-For an annotated line-by-line view instead of the summary:
+For an annotated line-by-line HTML view instead of the summary, build the
+`fuzz_coverage_html` target (writes `coverage-html/index.html` in the build
+dir):
 
-    llvm-cov show build/cov/fuzz_msg \
-        -instr-profile=build/cov/fuzz_msg.profdata lan80xx_spid.c
+    cmake --build build/cov --target fuzz_coverage_html
 
 ## Scope and next steps
 

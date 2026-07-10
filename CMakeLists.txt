@@ -4,6 +4,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(mepa_spidev_proxy VERSION 2026.07 LANGUAGES C)
 
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)   # group fuzz_* targets in IDEs
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
@@ -66,49 +68,11 @@ set_target_properties(lan80xx_spid PROPERTIES OUTPUT_NAME "lan80xx-spid")
 add_executable(spiproxy_cli spiproxy_cli.c parse.c)
 set_target_properties(spiproxy_cli PROPERTIES OUTPUT_NAME "spiproxy-cli")
 
-# Fuzzing harness: #includes lan80xx_spid.c (SPIPROXY_FUZZ drops main + stubs
-# the SPI backend). Needs clang for -fsanitize=fuzzer.
+# Fuzzing targets (harness + optional coverage reports) -- see fuzz/fuzz.cmake.
+# The SPIPROXY_FUZZ[_COVERAGE] options + their global flag interactions are
+# handled above; this only defines the targets, so it is included last.
 if(SPIPROXY_FUZZ)
-    add_executable(fuzz_msg fuzz/fuzz_msg.c log.c parse.c)
-    target_include_directories(fuzz_msg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(fuzz_msg PRIVATE SPIPROXY_FUZZ)
-    target_compile_options(fuzz_msg PRIVATE
-        -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-        -Wno-unused-function)
-    target_link_options(fuzz_msg PRIVATE -fsanitize=fuzzer,address,undefined)
-
-    # Optional: clang source-based coverage. `fuzz_coverage` replays the
-    # corpus through the harness and prints an llvm-cov report for the parser.
-    if(SPIPROXY_FUZZ_COVERAGE)
-        find_program(LLVM_PROFDATA NAMES llvm-profdata llvm-profdata-21
-                     llvm-profdata-20 llvm-profdata-19 llvm-profdata-18)
-        find_program(LLVM_COV NAMES llvm-cov llvm-cov-21 llvm-cov-20
-                     llvm-cov-19 llvm-cov-18)
-        if(NOT LLVM_PROFDATA OR NOT LLVM_COV)
-            message(FATAL_ERROR
-                "SPIPROXY_FUZZ_COVERAGE needs llvm-profdata and llvm-cov")
-        endif()
-        target_compile_options(fuzz_msg PRIVATE
-            -fprofile-instr-generate -fcoverage-mapping)
-        target_link_options(fuzz_msg PRIVATE -fprofile-instr-generate)
-        set(SPIPROXY_FUZZ_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus"
-            CACHE PATH "Corpus directory to replay for the coverage report")
-        add_custom_target(fuzz_coverage
-            COMMAND ${CMAKE_COMMAND} -E env
-                    ASAN_OPTIONS=symbolize=0 UBSAN_OPTIONS=symbolize=0
-                    LLVM_PROFILE_FILE=fuzz_msg.profraw
-                    $<TARGET_FILE:fuzz_msg> -runs=0 -print_funcs=0
-                    "${SPIPROXY_FUZZ_CORPUS}"
-            COMMAND ${LLVM_PROFDATA} merge -sparse fuzz_msg.profraw
-                    -o fuzz_msg.profdata
-            COMMAND ${LLVM_COV} report $<TARGET_FILE:fuzz_msg>
-                    -instr-profile=fuzz_msg.profdata
-                    "${CMAKE_CURRENT_SOURCE_DIR}/lan80xx_spid.c"
-            DEPENDS fuzz_msg
-            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-            USES_TERMINAL VERBATIM
-            COMMENT "Replaying corpus + llvm-cov report for lan80xx_spid.c")
-    endif()
+    include(fuzz/fuzz.cmake)
 endif()
 
 if (SPIPROXY_STATIC)

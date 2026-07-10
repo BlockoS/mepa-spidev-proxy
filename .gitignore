@@ -27,3 +27,7 @@ desktop.ini
 
 # Local commit-message scratch (see COMMIT_MSG workflow)
 /COMMIT_MSG
+
+# Coverage / profiling artifacts (llvm source-based coverage)
+*.profraw
+*.profdata
