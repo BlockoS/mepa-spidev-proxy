@@ -74,14 +74,18 @@ dir):
 
 ## Scope and next steps
 
-- **Sequences of requests.** Each input is a series of length-prefixed
-  messages replayed against two clients, so claim/release and the
-  cross-client lint hazards (page-ride / cor-poach / rmw-race) are exercised.
-  The mailbox in-flight guard and the abnormal-claim cleanup still need the
-  transport layer (op interleaving / client death), which is compiled out.
-- **Transport framing bypassed.** `exec_item()` is called directly, so
-  `client_msg()`'s `ver`/`len` checks aren't covered — add a second harness
-  over that layer if wanted.
+- **Real scheduler + fuzzed device replies.** Each input is a `spi_feed`
+  followed by a sequence of length-prefixed messages. The messages go through
+  the real `enqueue()`/`drain_queues()` path against two clients, exercising
+  the priority queues, `item_eligible()` claim gating, and the cross-client
+  lint hazards (page-ride / cor-poach / rmw-race); the SPI backend returns the
+  `spi_feed`, so mailbox response parsing / CRC is driven by the input.
+- **Transport framing bypassed.** Messages are handed to `enqueue()`
+  directly, so `client_msg()`'s `ver`/`len` checks aren't covered -- add a
+  harness over that layer if wanted.
+- **Still out of reach.** The mailbox in-flight guard (needs the poll to spin
+  so drain interleaves) and the abnormal-claim cleanup (needs client death /
+  max_ms expiry) -- both in the compiled-out transport.
 - **Depth.** Pair with AFL++ (`afl-clang-lto`, persistent mode + cmplog) to
   crack the header/CRC magic values faster than coverage alone.
 - **CI.** ClusterFuzzLite in GitHub Actions gives short per-PR campaigns.

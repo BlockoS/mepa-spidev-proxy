@@ -334,7 +334,27 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
     g.n_reads++;
     return 0;
 }
-#else   /* SPIPROXY_FUZZ: hardware-free deterministic SPI backend */
+#else   /* SPIPROXY_FUZZ: hardware-free SPI backend, responses fed by fuzzer */
+/* spi_read_reg pulls its result from this fuzzer-supplied feed (set by the
+ * harness before draining), so device replies -- mailbox response words,
+ * register reads -- are part of the fuzz input. MB_FLAG is the one exception:
+ * it always reports the response ready so exec_mailbox's poll loop returns at
+ * once instead of spinning to its (wall-clock) timeout. */
+static const uint8_t *g_fuzz_spi;
+static size_t g_fuzz_spi_len;
+static size_t g_fuzz_spi_pos;
+
+static uint32_t fuzz_spi_next(void)
+{
+    uint32_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < 4 && g_fuzz_spi_pos < g_fuzz_spi_len; i++) {
+        v |= (uint32_t)g_fuzz_spi[g_fuzz_spi_pos++] << (i * 8);
+    }
+    return v;   /* exhausted feed reads as 0 */
+}
+
 static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
 {
     (void)slice;
@@ -348,11 +368,9 @@ static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
 static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
 {
     (void)slice;
-    /* Report the mailbox response ready so exec_mailbox's poll loop returns
-     * at once instead of spinning to its timeout on fuzz input. */
     *val = (mmd == LAN80XX_MMD_GLOBAL && reg == MB_FLAG)
          ? MB_F_RESP
-         : ((uint32_t)mmd << 16 | reg);
+         : fuzz_spi_next();
     g.n_reads++;
     return 0;
 }

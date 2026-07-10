@@ -1,23 +1,29 @@
 // Copyright (c) 2026 Vincent Jardin, Vincent Cruz, Free Mobile
 // SPDX-License-Identifier: BSD-4-Clause
 //
-// libFuzzer harness for the lan80xx-spid request parser.
+// libFuzzer harness for the lan80xx-spid request path.
 //
 // It #includes lan80xx_spid.c built with -DSPIPROXY_FUZZ, which drops main()
-// and swaps the SPI backend for hardware-free deterministic stubs, giving
-// this TU direct access to the (static) daemon internals.
+// and swaps the SPI backend for a fuzzer-driven stub, giving this TU direct
+// access to the (static) daemon internals.
 //
-// Each input is a *sequence* of length-prefixed requests replayed through
-// exec_item() against two synthetic clients, so stateful paths are exercised:
-// whole-device claim/release, and the cross-client lint hazards (page-ride /
-// cor-poach / rmw-race) that only fire across differing client ids. Framing
-// per message: a 16-bit little-endian word whose top bit selects the client
-// (0/1) and whose low 15 bits are the message length (spiproxy_hdr + body);
-// the message bytes follow. No sockets, epoll, or hardware.
+// Each input is:
+//     [u16 spi_feed_len][spi_feed bytes][ message sequence ]
+// The spi_feed drives the stub SPI backend (spi_read_reg returns successive
+// 4-byte little-endian words from it), so device replies -- mailbox response
+// words in particular -- are fuzzed. The message sequence is a run of
+// length-prefixed requests; each is a 16-bit frame (top bit = which of two
+// clients, low 15 bits = message length) followed by the spiproxy_hdr + body.
 //
-// Not covered: client_msg()'s transport framing (exec_item is called
-// directly) and the abnormal-claim cleanup path (needs client death or the
-// max_ms expiry -- both in the compiled-out transport layer).
+// Rather than call exec_item() directly, the harness enqueue()s the messages
+// and runs the real drain_queues() scheduler, so the queue, priority classes,
+// item_eligible() and the whole-device claim gating are exercised, along with
+// the cross-client lint hazards (page-ride / cor-poach / rmw-race). No
+// sockets, epoll, or hardware.
+//
+// Not covered: client_msg()'s transport framing (bypassed), the mailbox
+// in-flight guard (needs the poll to spin so drain interleaves), and the
+// abnormal-claim cleanup (needs client death / max_ms expiry).
 
 #include "lan80xx_spid.c"
 
@@ -38,25 +44,54 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     return 0;
 }
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+/* Fresh per-input daemon state: dispatch/lint flags, the trace + rmw rings,
+ * and the qitem freelist/queues (rebuilt, not the ~1 MB of bodies). */
+static void fuzz_reset(void)
 {
-    client_t cl[FUZZ_NCLIENTS];
-    size_t off = 0;
     int i;
 
-    /* Fresh dispatch + lint state so each input is independent. The qitem
-     * pool is untouched (exec_item is called directly), so there is no need
-     * to clear the ~1 MB of it. */
     g.claim_owner = NULL;
     g.claim_ncleanup = 0;
     g.claim_deadline = 0;
     g.mb_inflight = 0;
     g.ring_w = 0;
     g.rd_w = 0;
+    g.n_queued = 0;
     memset(g.page_owner, 0, sizeof(g.page_owner));
     memset(g.cor_last, 0, sizeof(g.cor_last));
     memset(g.rd_ring, 0, sizeof(g.rd_ring));
+    for (i = 0; i < MAX_QITEMS - 1; i++) {
+        g.pool[i].next = &g.pool[i + 1];
+    }
+    g.pool[MAX_QITEMS - 1].next = NULL;
+    g.freel = &g.pool[0];
+    for (i = 0; i < 3; i++) {
+        g.qh[i] = NULL;
+        g.qt[i] = NULL;
+    }
+}
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    client_t cl[FUZZ_NCLIENTS];
+    size_t off, feed_len;
+    int i;
+
+    if (size < 2) {
+        return 0;
+    }
+    /* [u16 spi_feed_len][spi_feed][message sequence] */
+    feed_len = (size_t)(data[0] | ((size_t)data[1] << 8));
+    off = 2;
+    if (feed_len > size - off) {
+        feed_len = size - off;
+    }
+    g_fuzz_spi = data + off;
+    g_fuzz_spi_len = feed_len;
+    g_fuzz_spi_pos = 0;
+    off += feed_len;
+
+    fuzz_reset();
     for (i = 0; i < FUZZ_NCLIENTS; i++) {
         memset(&cl[i], 0, sizeof(cl[i]));
         cl[i].used = 1;
@@ -64,36 +99,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         cl[i].fd = -1;   /* send_resp()'s send() fails harmlessly */
     }
 
-    /* Replay a sequence of length-prefixed messages. */
+    /* Enqueue a sequence of length-prefixed messages. */
     while (off + 2 <= size) {
         uint16_t framing = (uint16_t)(data[off] | ((uint16_t)data[off + 1] << 8));
-        unsigned who = framing >> 15;         /* client selector (0/1) */
-        size_t mlen = framing & 0x7FFFU;      /* message length (hdr + body) */
+        unsigned who = framing >> 15;          /* client selector (0/1) */
+        size_t mlen = framing & 0x7FFFU;       /* message length (hdr + body) */
+        struct spiproxy_hdr h;
         size_t avail;
-        qitem_t it;
-        uint32_t body;
 
         off += 2;
         avail = size - off;
         if (mlen > avail) {
             mlen = avail;
         }
-        if (mlen < sizeof(struct spiproxy_hdr)) {
+        if (mlen < sizeof(h)) {
             break;   /* not a whole message left */
         }
-        if (mlen > sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX) {
-            mlen = sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX;
+        if (mlen > sizeof(h) + SPIPROXY_MSG_MAX) {
+            mlen = sizeof(h) + SPIPROXY_MSG_MAX;
         }
-
-        memset(&it, 0, sizeof(it));
-        it.c = &cl[who % FUZZ_NCLIENTS];
-        memcpy(&it.hdr, data + off, sizeof(it.hdr));
-        body = (uint32_t)(mlen - sizeof(struct spiproxy_hdr));
-        it.hdr.len = body;   /* keep framing self-consistent for the checks */
-        memcpy(it.body, data + off + sizeof(struct spiproxy_hdr), body);
-
-        exec_item(&it);
+        memcpy(&h, data + off, sizeof(h));
+        h.len = (uint32_t)(mlen - sizeof(h));   /* self-consistent framing */
+        /* enqueue() only reads the body, so casting away const is safe. */
+        enqueue(&cl[who % FUZZ_NCLIENTS], &h,
+                (uint8_t *)(uintptr_t)(data + off + sizeof(h)));
         off += mlen;
     }
+
+    /* Run the real scheduler: eligibility, priority, claim gating. */
+    drain_queues(2 * MAX_QITEMS);
     return 0;
 }

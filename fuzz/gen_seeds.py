@@ -3,10 +3,16 @@
 # SPDX-License-Identifier: BSD-4-Clause
 """Generate a seed corpus for fuzz_msg.
 
-Each file is one request datagram (spiproxy_hdr + body) covering a command
-type, so the fuzzer starts from valid framing instead of rediscovering it
-(and CI replays them as a regression set). Layouts mirror spiproxy.h. The
-harness overrides ver/len, but they are set correctly here too.
+Each file is one fuzz input in the harness format:
+
+    [u16 spi_feed_len][spi_feed][ framed message ... ]
+
+where the spi_feed drives the stub SPI backend (device replies) and each
+framed message is a u16 (top bit = client 0/1, low 15 bits = length) followed
+by a spiproxy_hdr + body. Seeds cover one valid request per command type plus
+a couple of stateful sequences (claim/release, cross-client) and a mailbox
+with a fabricated response, so the fuzzer starts from valid framing and CI has
+a regression set. Layouts mirror spiproxy.h; the harness overrides ver/len.
 
 Usage:
     gen_seeds.py <corpus-dir>
@@ -35,22 +41,47 @@ def op(slice_: int, write: int, mmd: int, reg: int, val: int) -> bytes:
     return struct.pack("<BBBBHHI", slice_, write, mmd, 0, reg, 0, val)
 
 
+def frame(msg: bytes, client: int = 0) -> bytes:
+    return struct.pack("<H", ((client & 1) << 15) | (len(msg) & 0x7FFF)) + msg
+
+
+def make(messages: list[tuple[int, bytes]], feed: bytes = b"") -> bytes:
+    """messages: list of (client, message-bytes); prepend the spi feed."""
+    out = struct.pack("<H", len(feed)) + feed
+    for client, msg in messages:
+        out += frame(msg, client)
+    return out
+
+
+def one(msg_type: int, body: bytes, feed: bytes = b"") -> bytes:
+    return make([(0, hdr(msg_type, body))], feed)
+
+
 def seeds() -> dict[str, bytes]:
     claim = struct.pack("<IHH", 100, 1, 0) + op(0, 0, 0x1E, 0x0000, 0)
     payload = bytes([0xAA, 0xBB, 0xCC, 0xDD])
     mb = struct.pack("<BBHI", 0, 0x19, len(payload), 0) + payload
+    rd = op(0, 0, 0x1E, 0x0000, 0)
+    rel = hdr(RELEASE, b"")
+    # A fabricated mailbox response: the header word read (2nd read consumed)
+    # encodes len=8, enough to walk the response-assembly + CRC path.
+    mb_feed = bytes([0, 0, 0, 0,  0, 0, 8, 0]) + bytes([0xAA] * 8)
     return {
-        "read":    hdr(READ,  op(0, 0, 0x1E, 0x0000, 0)),
-        "write":   hdr(WRITE, op(0, 1, 0x0B, 0x0021, 0x1234)),
-        "batch":   hdr(BATCH, op(0, 0, 0x09, 0x8002, 0)
+        "read":    one(READ,  rd),
+        "write":   one(WRITE, op(0, 1, 0x0B, 0x0021, 0x1234)),
+        "batch":   one(BATCH, op(0, 0, 0x09, 0x8002, 0)
                               + op(0, 0, 0x01, 0x0001, 0)
                               + op(1, 1, 0x0B, 0xE019, 0xFF)),
-        "claim":   hdr(CLAIM, claim),
-        "release": hdr(RELEASE, b""),
-        "mailbox": hdr(MAILBOX, mb),
-        "stats":   hdr(STATS, b""),
-        "trace":   hdr(TRACE, b""),
-        "reset":   hdr(RESET, struct.pack("<II", 10000, 100000)),
+        "claim":   one(CLAIM, claim),
+        "release": one(RELEASE, b""),
+        "mailbox": one(MAILBOX, mb),
+        "mailbox_resp": one(MAILBOX, mb, feed=mb_feed),
+        "stats":   one(STATS, b""),
+        "trace":   one(TRACE, b""),
+        "reset":   one(RESET, struct.pack("<II", 10000, 100000)),
+        # stateful sequences (exercise the queue + claim gating)
+        "claim_seq":   make([(0, hdr(CLAIM, claim)), (0, hdr(READ, rd)), (0, rel)]),
+        "cross_claim": make([(0, hdr(CLAIM, claim)), (1, hdr(READ, rd)), (0, rel)]),
     }
 
 
