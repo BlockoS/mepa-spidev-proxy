@@ -74,8 +74,11 @@ dir):
 
 ## Scope and next steps
 
-- **Single message per input.** Feed a length-prefixed sequence to exercise
-  stateful paths (claim → op → release; the mailbox in-flight guard).
+- **Sequences of requests.** Each input is a series of length-prefixed
+  messages replayed against two clients, so claim/release and the
+  cross-client lint hazards (page-ride / cor-poach / rmw-race) are exercised.
+  The mailbox in-flight guard and the abnormal-claim cleanup still need the
+  transport layer (op interleaving / client death), which is compiled out.
 - **Transport framing bypassed.** `exec_item()` is called directly, so
   `client_msg()`'s `ver`/`len` checks aren't covered — add a second harness
   over that layer if wanted.
