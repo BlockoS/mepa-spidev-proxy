@@ -8,7 +8,7 @@
 //   spiproxy-cli [-s sock] bench <n>              # proxied read RTT stats
 //   spiproxy-cli [-s sock] hammer <seconds>       # low-prio read flood
 //   spiproxy-cli [-s sock] claimtest <ms>         # claim, read, hold, release
-//   spiproxy-cli [-s sock] mailbox <cmd> [hexbytes] [timeout_ms]
+//   spiproxy-cli [-s sock] [-t ms] mailbox <cmd> [hexbytes]  # -t: MB timeout
 //   spiproxy-cli [-s sock] reset [assert_us [deassert_us]]  # HW reset pulse
 //   spiproxy-cli [-s sock] stats | trace
 
@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -25,8 +27,10 @@
 
 #include "spiproxy.h"
 #include "lan80xx_regs.h"
+#include "parse.h"
 
 static int sock_fd = -1;
+static const char *sock = SPIPROXY_SOCK;
 static uint32_t seq;
 
 static uint64_t now_us(void)
@@ -42,6 +46,19 @@ static int xfer(uint8_t type, uint16_t flags, const void *body, uint32_t blen,
     uint8_t msg[sizeof(struct spiproxy_hdr) + SPIPROXY_MSG_MAX];
     struct spiproxy_hdr *h = (struct spiproxy_hdr *)msg;
     ssize_t n;
+
+    if (sock_fd < 0) {   /* connect lazily, so arg validation can fail first */
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+
+        sock_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        strncpy(sa.sun_path, sock, sizeof(sa.sun_path) - 1);
+        if (connect(sock_fd, (struct sockaddr *)&sa, sizeof(sa))) {
+            perror(sock);
+            close(sock_fd);
+            sock_fd = -1;
+            return -1;
+        }
+    }
 
     h->ver = SPIPROXY_VER;
     h->type = type;
@@ -78,37 +95,37 @@ static int cmp_u32(const void *a, const void *b)
 
 int main(int argc, char **argv)
 {
-    const char *sock = SPIPROXY_SOCK;
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
     struct spiproxy_op op = { 0 };
     uint32_t rlen;
+    unsigned long v, timeout_ms = 0;
     int o, st;
 
-    while ((o = getopt(argc, argv, "s:h")) != -1) {
+    while ((o = getopt(argc, argv, "s:t:h")) != -1) {
         if (o == 's') {
             sock = optarg;
+        } else if (o == 't') {
+            if (!parse_uint(optarg, 0, 0, 0xffffffff, &timeout_ms)) {
+                return EXIT_FAILURE;
+            }
         } else {
             fprintf(stderr, "see header comment for usage\n");
-            return 1;
+            return EXIT_FAILURE;
         }
     }
     argc -= optind;
     argv += optind;
     if (argc < 1) {
         fprintf(stderr, "missing command\n");
-        return 1;
-    }
-    sock_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
-    strncpy(sa.sun_path, sock, sizeof(sa.sun_path) - 1);
-    if (connect(sock_fd, (struct sockaddr *)&sa, sizeof(sa))) {
-        perror(sock);
-        return 1;
+        return EXIT_FAILURE;
     }
 
     if (!strcmp(argv[0], "read") && argc == 4) {
-        op.slice = (uint8_t)strtoul(argv[1], NULL, 0);
-        op.mmd = (uint8_t)strtoul(argv[2], NULL, 0);
-        op.reg = (uint16_t)strtoul(argv[3], NULL, 0);
+        if (!parse_uint(argv[1], 0, 0, 0xff, &v)) return EXIT_FAILURE;
+        op.slice = (uint8_t)v;
+        if (!parse_uint(argv[2], 0, 0, 0xff, &v)) return EXIT_FAILURE;
+        op.mmd = (uint8_t)v;
+        if (!parse_uint(argv[3], 0, 0, 0xffff, &v)) return EXIT_FAILURE;
+        op.reg = (uint16_t)v;
         rlen = sizeof(op);
         st = xfer(SPIPROXY_READ, 0, &op, sizeof(op), &op, &rlen);
         printf("status=%d slice=%u mmd=0x%02x reg=0x%04x val=0x%08x\n",
@@ -116,10 +133,14 @@ int main(int argc, char **argv)
         return st != SPIPROXY_OK;
     }
     if (!strcmp(argv[0], "write") && argc == 5) {
-        op.slice = (uint8_t)strtoul(argv[1], NULL, 0);
-        op.mmd = (uint8_t)strtoul(argv[2], NULL, 0);
-        op.reg = (uint16_t)strtoul(argv[3], NULL, 0);
-        op.val = (uint32_t)strtoul(argv[4], NULL, 0);
+        if (!parse_uint(argv[1], 0, 0, 0xff, &v)) return EXIT_FAILURE;
+        op.slice = (uint8_t)v;
+        if (!parse_uint(argv[2], 0, 0, 0xff, &v)) return EXIT_FAILURE;
+        op.mmd = (uint8_t)v;
+        if (!parse_uint(argv[3], 0, 0, 0xffff, &v)) return EXIT_FAILURE;
+        op.reg = (uint16_t)v;
+        if (!parse_uint(argv[4], 0, 0, 0xffffffff, &v)) return EXIT_FAILURE;
+        op.val = (uint32_t)v;
         rlen = sizeof(op);
         st = xfer(SPIPROXY_WRITE, 0, &op, sizeof(op), &op, &rlen);
         printf("status=%d\n", st);
@@ -128,10 +149,14 @@ int main(int argc, char **argv)
     if (!strcmp(argv[0], "reset")) {
         struct spiproxy_reset rq = { 0 };
 
-        if (argc >= 2)
-            rq.assert_us = (uint32_t)strtoul(argv[1], NULL, 0);
-        if (argc >= 3)
-            rq.deassert_us = (uint32_t)strtoul(argv[2], NULL, 0);
+        if (argc >= 2) {
+            if (!parse_uint(argv[1], 0, 0, 0xffffffff, &v)) return EXIT_FAILURE;
+            rq.assert_us = (uint32_t)v;
+        }
+        if (argc >= 3) {
+            if (!parse_uint(argv[2], 0, 0, 0xffffffff, &v)) return EXIT_FAILURE;
+            rq.deassert_us = (uint32_t)v;
+        }
         st = xfer(SPIPROXY_RESET, 0, &rq, sizeof(rq), NULL, NULL);
         if (st == SPIPROXY_ENOSYS)
             fprintf(stderr,
@@ -141,9 +166,17 @@ int main(int argc, char **argv)
         return st != SPIPROXY_OK;
     }
     if (!strcmp(argv[0], "bench") && argc == 2) {
-        int n = atoi(argv[1]), i;
-        uint32_t *lat = calloc(n, sizeof(*lat));
+        int n, i;
+        uint32_t *lat;
         uint64_t t;
+
+        if (!parse_uint(argv[1], 10, 1, INT_MAX, &v)) return EXIT_FAILURE;
+        n = (int)v;
+        lat = calloc(n, sizeof(*lat));
+        if (lat == NULL) {
+            perror("calloc");
+            return EXIT_FAILURE;
+        }
         op.mmd = LAN80XX_MMD_GLOBAL;
         op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
         for (i = -50; i < n; i++) {
@@ -151,7 +184,7 @@ int main(int argc, char **argv)
             rlen = sizeof(op);
             if (xfer(SPIPROXY_READ, 0, &op, sizeof(op), &op, &rlen) != SPIPROXY_OK) {
                 fprintf(stderr, "read failed at %d\n", i);
-                return 1;
+                return EXIT_FAILURE;
             }
             if (i >= 0) {
                 lat[i] = (uint32_t)(now_us() - t);
@@ -161,11 +194,13 @@ int main(int argc, char **argv)
         printf("proxied read rtt: n=%d min=%u p50=%u p90=%u p99=%u max=%u us (val=0x%08x)\n",
                n, lat[0], lat[n / 2], lat[(int)(n * 0.9)],
                lat[(int)(n * 0.99)], lat[n - 1], op.val);
-        return 0;
+        return EXIT_SUCCESS;
     }
     if (!strcmp(argv[0], "hammer") && argc == 2) {
-        uint64_t t_end = now_us() + (uint64_t)atoi(argv[1]) * 1000000;
-        uint64_t cnt = 0;
+        uint64_t t_end, cnt = 0;
+
+        if (!parse_uint(argv[1], 10, 0, INT_MAX, &v)) return EXIT_FAILURE;
+        t_end = now_us() + (uint64_t)v * 1000000;
         op.mmd = LAN80XX_MMD_GLOBAL;
         op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
         while (now_us() < t_end) {
@@ -173,34 +208,36 @@ int main(int argc, char **argv)
             if (xfer(SPIPROXY_READ, SPIPROXY_PRIO_LOW, &op, sizeof(op),
                      &op, &rlen) != SPIPROXY_OK) {
                 fprintf(stderr, "hammer: read failed\n");
-                return 1;
+                return EXIT_FAILURE;
             }
             if (op.val == 0 || (op.val & 0xff00) != 0x8000) {
                 fprintf(stderr, "hammer: bad DEVICE_ID 0x%08x after %llu reads\n",
                         op.val, (unsigned long long)cnt);
-                return 1;
+                return EXIT_FAILURE;
             }
             cnt++;
         }
         printf("hammer: %llu reads, all DEVICE_ID ok (0x%08x)\n",
                (unsigned long long)cnt, op.val);
-        return 0;
+        return EXIT_SUCCESS;
     }
     if (!strcmp(argv[0], "claimtest") && argc == 2) {
         struct {
             struct spiproxy_claim cl;
             struct spiproxy_op cleanup[1];
         } __attribute__((packed)) req = {
-            .cl = { .max_ms = (uint32_t)atoi(argv[1]), .ncleanup = 1 },
+            .cl = { .ncleanup = 1 },
             /* harmless marker cleanup op: read DEVICE_ID */
             .cleanup = { { .slice = 0, .write = 0,
                            .mmd = LAN80XX_MMD_GLOBAL,
                            .reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG } },
         };
+        if (!parse_uint(argv[1], 10, 0, 0xffffffff, &v)) return EXIT_FAILURE;
+        req.cl.max_ms = (uint32_t)v;
         st = xfer(SPIPROXY_CLAIM, 0, &req, sizeof(req), NULL, NULL);
         printf("claim: status=%d\n", st);
         if (st != SPIPROXY_OK) {
-            return 1;
+            return EXIT_FAILURE;
         }
         op.mmd = LAN80XX_MMD_GLOBAL;
         op.reg = LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG;
@@ -210,25 +247,28 @@ int main(int argc, char **argv)
         usleep(200000);
         st = xfer(SPIPROXY_RELEASE, 0, NULL, 0, NULL, NULL);
         printf("release: status=%d\n", st);
-        return 0;
+        return EXIT_SUCCESS;
     }
     if (!strcmp(argv[0], "mailbox") && argc >= 2) {
         struct {
             struct spiproxy_mb mb;
             uint8_t payload[SPIPROXY_MB_MAX];
-        } __attribute__((packed)) req = { .mb = { .cmd = (uint8_t)strtoul(argv[1], NULL, 0) } };
+        } __attribute__((packed)) req = { 0 };
         uint8_t resp[sizeof(struct spiproxy_mb) + SPIPROXY_MB_MAX];
         struct spiproxy_mb *rmb = (struct spiproxy_mb *)resp;
         int i;
-        for (i = 2; i < argc - 1; i++) {
-            req.payload[req.mb.payload_len++] = (uint8_t)strtoul(argv[i], NULL, 16);
-        }
-        if (argc > 2) { /* last arg = timeout if numeric and large */
-            req.mb.timeout_ms = (uint32_t)strtoul(argv[argc - 1], NULL, 0);
-            if (req.mb.timeout_ms < 10) { /* it was a payload byte */
-                req.payload[req.mb.payload_len++] = (uint8_t)req.mb.timeout_ms;
-                req.mb.timeout_ms = 0;
+
+        if (!parse_uint(argv[1], 0, 0, 0xff, &v)) return EXIT_FAILURE;
+        req.mb.cmd = (uint8_t)v;
+        req.mb.timeout_ms = (uint32_t)timeout_ms;  /* -t; 0 = daemon default */
+        for (i = 2; i < argc; i++) {   /* every remaining arg is a hex byte */
+            if (req.mb.payload_len >= SPIPROXY_MB_MAX) {
+                fprintf(stderr, "mailbox: too many payload bytes (max %d)\n",
+                        SPIPROXY_MB_MAX);
+                return EXIT_FAILURE;
             }
+            if (!parse_uint(argv[i], 16, 0, 0xff, &v)) return EXIT_FAILURE;
+            req.payload[req.mb.payload_len++] = (uint8_t)v;
         }
         rlen = sizeof(resp);
         st = xfer(SPIPROXY_MAILBOX, 0, &req, sizeof(req.mb) + req.mb.payload_len,
@@ -253,5 +293,5 @@ int main(int argc, char **argv)
         return st != SPIPROXY_OK;
     }
     fprintf(stderr, "unknown command '%s'\n", argv[0]);
-    return 1;
+    return EXIT_FAILURE;
 }

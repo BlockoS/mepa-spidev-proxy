@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -36,6 +38,7 @@
 #include "spiproxy.h"
 #include "lan80xx_regs.h"
 #include "log.h"
+#include "parse.h"
 
 #define MAX_CLIENTS    16
 #define MAX_QITEMS     256
@@ -364,7 +367,6 @@ static void lint_op(const struct spiproxy_op *op)
     uint64_t now = now_us();
     int side = op->mmd == LAN80XX_MMD_HOST_PMA ? 0 :
                op->mmd == LAN80XX_MMD_LINE_PMA ? 1 : -1;
-    unsigned i;
 
     /* page-ride + page-owner tracking (HOST=0x09 / LINE=0x01 PMA8) */
     if (side >= 0 && (op->reg & 0xfe00) == 0xf000) {
@@ -400,7 +402,7 @@ static void lint_op(const struct spiproxy_op *op)
     }
     /* rmw-race: write to a register recently read by someone else */
     if (op->write) {
-        for (i = 0; i < RD_RING_COUNT; i++) {
+        for (unsigned int i = 0; i < RD_RING_COUNT; i++) {
             if (g.rd_ring[i].cid != 0 && g.rd_ring[i].cid != g.lctx.cid &&
                 g.rd_ring[i].slice == op->slice &&
                 g.rd_ring[i].mmd == op->mmd && g.rd_ring[i].reg == op->reg &&
@@ -429,8 +431,6 @@ static void lint_op(const struct spiproxy_op *op)
 /* Execute one register op; returns a spiproxy_status. */
 static int exec_op(client_t *c, struct spiproxy_op *op)
 {
-    int rc;
-
     if (op->slice >= SLICE_COUNT) {
         return SPIPROXY_EINVAL;
     }
@@ -439,8 +439,8 @@ static int exec_op(client_t *c, struct spiproxy_op *op)
         c != NULL) {
         return SPIPROXY_EBUSY; /* mailbox region while a MB tx is in flight */
     }
-    rc = op->write ? spi_write_reg(op->slice, op->mmd, op->reg, op->val)
-                   : spi_read_reg(op->slice, op->mmd, op->reg, &op->val);
+    int rc = op->write ? spi_write_reg(op->slice, op->mmd, op->reg, op->val)
+                       : spi_read_reg(op->slice, op->mmd, op->reg, &op->val);
     trace_add(c, op);
     if (rc == 0) {
         lint_op(op);
@@ -495,10 +495,9 @@ static int mb_wr(uint8_t slice, uint16_t reg, uint32_t val)
 static uint16_t crc16_ccitt(const uint8_t *p, size_t n)
 {
     uint16_t crc = 0xffff;
-    int i;
     while (n--) {
         crc ^= (uint16_t)(*p++) << 8;
-        for (i = 0; i < 8; i++) {
+        for (int i = 0; i < 8; i++) {
             crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
         }
     }
@@ -515,8 +514,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
     uint32_t v, timeout = mb->timeout_ms ? mb->timeout_ms : MB_TIMEOUT_MS;
     uint16_t len = MB_HDR_LEN + mb->payload_len + MB_CRC_LEN, crc, wlen;
     uint64_t t_end;
-    int i;
-
+    
     if (mb->payload_len > SPIPROXY_MB_MAX || mb->slice >= SLICE_COUNT) {
         return SPIPROXY_EINVAL;
     }
@@ -540,7 +538,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
     g.mb_inflight = 1;
     /* request words (LE), length rounded to 4 */
     wlen = (len + 3) & ~3;
-    for (i = 0; i < wlen; i += 4) {
+    for (int i = 0; i < wlen; i += 4) {
         v = (uint32_t)pkt[i] | (uint32_t)pkt[i + 1] << 8 |
             (uint32_t)pkt[i + 2] << 16 | (uint32_t)pkt[i + 3] << 24;
         if (mb_wr(mb->slice, MB_CMD_ADDR + i / 4, v)) {
@@ -585,7 +583,7 @@ static int exec_mailbox(client_t *c, struct spiproxy_mb *mb,
     pkt[2] = (uint8_t)(v >> 16);
     pkt[3] = (uint8_t)(v >> 24);
     wlen = (len + 3) & ~3;
-    for (i = 4; i < wlen; i += 4) {
+    for (int i = 4; i < wlen; i += 4) {
         if (mb_rd(mb->slice, MB_RESP_ADDR + i / 4, &v)) {
             goto io_err;
         }
@@ -678,32 +676,30 @@ static void claim_end(int abnormal)
 static int gpio_open_line_by_name(const char *name)
 {
     char path[sizeof("/dev/gpiochip") + 11];   /* + up to 11 digits of an int */
-    int n, fd = -1;
+    int fd = -1;
 
-    for (n = 0; n < 64 && fd < 0; n++) {
-        struct gpiochip_info ci;
-        uint32_t off;
-        int chip;
-
+    for (int n = 0; n < 64 && fd < 0; n++) {
         snprintf(path, sizeof(path), "/dev/gpiochip%d", n);
-        chip = open(path, O_RDONLY | O_CLOEXEC);
+        int chip = open(path, O_RDONLY | O_CLOEXEC);
         if (chip < 0)
             continue;
-        memset(&ci, 0, sizeof(ci));
-        if (ioctl(chip, GPIO_GET_CHIPINFO_IOCTL, &ci) == 0) {
-            for (off = 0; off < ci.lines; off++) {
-                struct gpio_v2_line_info li;
-                struct gpio_v2_line_request req;
 
-                memset(&li, 0, sizeof(li));
-                li.offset = off;
+        struct gpiochip_info ci = {0};
+        if (ioctl(chip, GPIO_GET_CHIPINFO_IOCTL, &ci) == 0) {
+            for (uint32_t off = 0; off < ci.lines; off++) {
+                struct gpio_v2_line_info li = {
+                    .offset = off,
+                };
                 if (ioctl(chip, GPIO_V2_GET_LINEINFO_IOCTL, &li) ||
-                    strcmp(li.name, name))
+                    strcmp(li.name, name)) {
                     continue;
-                memset(&req, 0, sizeof(req));
-                req.offsets[0] = off;
-                req.num_lines = 1;
-                req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+                }
+
+                struct gpio_v2_line_request req = {
+                    .offsets = { [0] = off },
+                    .num_lines = 1,
+                    .config.flags = GPIO_V2_LINE_FLAG_OUTPUT,
+                };
                 strncpy(req.consumer, "lan80xx-spid",
                         sizeof(req.consumer) - 1);
                 if (ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &req) == 0 &&
@@ -1073,6 +1069,7 @@ int main(int argc, char **argv)
     struct epoll_event ev = { .events = EPOLLIN }, evs[8];
     uint32_t id = 0;
     int o, i, mode = 0;
+    unsigned long v;
 
     g.sock = SPIPROXY_SOCK;
     g.pad = 1;
@@ -1082,32 +1079,42 @@ int main(int argc, char **argv)
         switch (o) {
         case 'd': g.dev = optarg; break;
         case 's': g.sock = optarg; break;
-        case 'p': g.pad = atoi(optarg); break;
-        case 'f': g.freq = atoi(optarg); break;
+        case 'p':
+            if (!parse_uint(optarg, 10, 0, SPI_PAD_MAX, &v)) {
+                return EXIT_FAILURE;
+            }
+            g.pad = (int)v;
+            break;
+        case 'f':
+            if (!parse_uint(optarg, 10, 1, INT_MAX, &v)) {
+                return EXIT_FAILURE;
+            }
+            g.freq = (int)v;
+            break;
         case 'r': g.rst_line = optarg; break;
         case 'L':
             g.log = strcmp(optarg, "-") ? fopen(optarg, "w") : stderr;
             if (g.log == NULL) {
                 perror(optarg);
-                return 1;
+                return EXIT_FAILURE;
             }
             break;
-        default: usage(argv[0]); return 1;
+        default: usage(argv[0]); return EXIT_FAILURE;
         }
     }
     g.lctx.tag = "";
-    if (g.dev == NULL || g.pad < 0 || g.pad > SPI_PAD_MAX) {
+    if (g.dev == NULL) {
         usage(argv[0]);
-        return 1;
+        return EXIT_FAILURE;
     }
     log_open("lan80xx-spid", g.log);
     if ((g.spi_fd = open(g.dev, O_RDWR)) < 0) {
         log_error("%s: %s", g.dev, strerror(errno));
-        return 1;
+        return EXIT_FAILURE;
     }
     if (flock(g.spi_fd, LOCK_EX | LOCK_NB)) {
         log_error("%s: already locked (another owner?)", g.dev);
-        return 1;
+        return EXIT_FAILURE;
     }
     ioctl(g.spi_fd, SPI_IOC_WR_MODE, &mode);
     /* startup sanity: DEVICE_ID must answer on slice 0 */
@@ -1127,7 +1134,7 @@ int main(int argc, char **argv)
     if (bind(g.srv_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
         listen(g.srv_fd, 8)) {
         log_error("%s: %s", g.sock, strerror(errno));
-        return 1;
+        return EXIT_FAILURE;
     }
     g.ep_fd = epoll_create1(EPOLL_CLOEXEC);
     ev.data.ptr = NULL; /* NULL = listening socket */
@@ -1162,5 +1169,5 @@ int main(int argc, char **argv)
     unlink(g.sock);
     log_always("lan80xx-spid: exit");
     log_close();
-    return 0;
+    return EXIT_SUCCESS;
 }
