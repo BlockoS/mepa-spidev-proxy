@@ -93,6 +93,39 @@ dir):
 
     cmake --build build/cov --target fuzz_coverage_html
 
+## AFL++ (cracking the CRC / magic values)
+
+libFuzzer's random mutation rarely satisfies the mailbox response CRC or the
+discrete type/mmd/register constants, so those branches stay shallow. AFL++'s
+CMPLOG (redqueen) instrumentation solves comparisons directly. The harnesses
+run under AFL++ unchanged -- its clang wrapper links an AFL persistent-mode
+driver when it sees `-fsanitize=fuzzer`. `fuzz/Makefile` builds each harness's
+ASan+UBSan target plus a CMPLOG companion; `fuzz/run.sh` (invoked by `make run`)
+launches the fuzzing. Like the CMake build it needs `MESA_ROOT_DIR` to generate
+`lan80xx_regs.h` -- export it once and the recipes pick it up:
+
+    sudo apt-get install -y afl++              # 4.33+ (plus lld for afl-clang-lto)
+    export MESA_ROOT_DIR=/path/to/mesa
+    make -C fuzz                               # build build/afl/<h>_{afl,cmplog}
+    make -C fuzz run T=fuzz_msg S=7200         # fuzz T for S s across all cores
+    make -C fuzz run T=fuzz_msg S=300 J=1      # single instance, live AFL UI
+    make -C fuzz run T=fuzz_msg S=7200 J=8     # cap to 8 instances
+    make -C fuzz status T=fuzz_msg             # live afl-whatsup (no build; MESA not needed)
+
+`J` (default: physical core count) picks the instance count -- `J>1` runs a
+fleet (1 main + J-1 secondaries, each pinned to a free core, logging to
+`build/afl/out-<T>-*.log`). The default is physical cores, not logical CPUs, so
+one fuzzer lands per core and the SMT siblings stay idle (avoids the
+execution-unit/cache contention that halves per-core throughput).
+`<h>_afl` carries ASan+UBSan (the oracle); `<h>_cmplog` is the `-c`
+comparison-cracking companion. Findings land in `build/afl/out-<T>/*/crashes/`;
+reproduce one against the libFuzzer binary:
+
+    build/fuzz/fuzz_msg build/afl/out-fuzz_msg/*/crashes/id:000000*
+
+`fuzz/spiproxy.dict` lists the protocol's discrete constants; pass it to
+libFuzzer too with `-dict=fuzz/spiproxy.dict`.
+
 ## Scope and next steps
 
 - **Real scheduler + fuzzed device replies.** Each input is a `spi_feed`
@@ -122,3 +155,5 @@ dir):
   freelist, the queues are empty, and no mailbox tx is left in flight -- so a
   leak, double-free, or stuck in-flight guard on any path (error or normal) is
   caught, not just memory errors.
+- **Depth.** AFL++ CMPLOG cracks the mailbox CRC / magic-value branches that
+  coverage-only mutation stalls on -- see the AFL++ section above.
