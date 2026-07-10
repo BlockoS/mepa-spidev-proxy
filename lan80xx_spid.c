@@ -265,6 +265,7 @@ static void on_sig(int sig)
  * out during request N+1, so a logical read is one 2-transfer ioctl
  * (request, then a dummy DEVICE_ID request that collects the data).
  */
+#ifndef SPIPROXY_FUZZ
 static void spi_fill(uint8_t *tx, int write, uint32_t addr, uint32_t val)
 {
     memset(tx, 0xff, SPI_BUF_MAX);
@@ -333,6 +334,29 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
     g.n_reads++;
     return 0;
 }
+#else   /* SPIPROXY_FUZZ: hardware-free deterministic SPI backend */
+static int spi_write_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t val)
+{
+    (void)slice;
+    (void)mmd;
+    (void)reg;
+    (void)val;
+    g.n_writes++;
+    return 0;
+}
+
+static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
+{
+    (void)slice;
+    /* Report the mailbox response ready so exec_mailbox's poll loop returns
+     * at once instead of spinning to its timeout on fuzz input. */
+    *val = (mmd == LAN80XX_MMD_GLOBAL && reg == MB_FLAG)
+         ? MB_F_RESP
+         : ((uint32_t)mmd << 16 | reg);
+    g.n_reads++;
+    return 0;
+}
+#endif  /* SPIPROXY_FUZZ */
 
 static void trace_add(client_t *c, const struct spiproxy_op *op)
 {
@@ -1063,6 +1087,7 @@ static void usage(const char *p)
             "      claim + client lifecycle\n", p, SPIPROXY_SOCK);
 }
 
+#ifndef SPIPROXY_FUZZ
 int main(int argc, char **argv)
 {
     struct sockaddr_un sa = { .sun_family = AF_UNIX };
@@ -1171,3 +1196,4 @@ int main(int argc, char **argv)
     log_close();
     return EXIT_SUCCESS;
 }
+#endif  /* SPIPROXY_FUZZ */

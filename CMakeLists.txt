@@ -12,9 +12,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(SPIPROXY_STATIC   "Link the executables statically" OFF)
 option(SPIPROXY_SANITIZE "Build with AddressSanitizer + UBSan (dev/CI)" OFF)
+option(SPIPROXY_FUZZ     "Build the libFuzzer request-parser harness (needs clang)" OFF)
 
-if(SPIPROXY_SANITIZE AND SPIPROXY_STATIC)
-    message(FATAL_ERROR "SPIPROXY_SANITIZE and SPIPROXY_STATIC are mutually exclusive")
+if(SPIPROXY_STATIC AND (SPIPROXY_SANITIZE OR SPIPROXY_FUZZ))
+    message(FATAL_ERROR "SPIPROXY_STATIC is incompatible with SPIPROXY_SANITIZE / SPIPROXY_FUZZ")
 endif()
 
 # Default to an optimized build when none is chosen, so _FORTIFY_SOURCE
@@ -35,6 +36,9 @@ if(SPIPROXY_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
                         -fno-sanitize-recover=all)
     add_link_options(-fsanitize=address,undefined)
+elseif(SPIPROXY_FUZZ)
+    # The fuzz_msg target adds its own -fsanitize=fuzzer,address,undefined;
+    # keep _FORTIFY_SOURCE off globally (it conflicts with ASan).
 else()
     # Fortify libc buffer calls in optimized configs (inert otherwise); -U
     # first so it stays warning-free even when a buildroot/yocto toolchain
@@ -60,6 +64,18 @@ set_target_properties(lan80xx_spid PROPERTIES OUTPUT_NAME "lan80xx-spid")
 
 add_executable(spiproxy_cli spiproxy_cli.c parse.c)
 set_target_properties(spiproxy_cli PROPERTIES OUTPUT_NAME "spiproxy-cli")
+
+# Fuzzing harness: #includes lan80xx_spid.c (SPIPROXY_FUZZ drops main + stubs
+# the SPI backend). Needs clang for -fsanitize=fuzzer.
+if(SPIPROXY_FUZZ)
+    add_executable(fuzz_msg fuzz/fuzz_msg.c log.c parse.c)
+    target_include_directories(fuzz_msg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(fuzz_msg PRIVATE SPIPROXY_FUZZ)
+    target_compile_options(fuzz_msg PRIVATE
+        -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
+        -Wno-unused-function)
+    target_link_options(fuzz_msg PRIVATE -fsanitize=fuzzer,address,undefined)
+endif()
 
 if (SPIPROXY_STATIC)
     target_link_options(lan80xx_spid PRIVATE -static)
