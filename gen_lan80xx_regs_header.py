@@ -3,26 +3,27 @@
 # SPDX-License-Identifier: BSD-4-Clause
 """Generate lan80xx_regs.h: MMD + register-address enums for lan80xx-spid.
 
-Reads the flat ``g_lan80xx_regs[]`` table emitted by lan80xx_apps'
-``gen_lan80xx_regs.py`` (itself derived from sw-mepa's regs_lan80xx_*.h)
-and emits symbolic C enums only -- no runtime table:
+Reads mesa's LAN80xx register headers directly (sw-mepa, the former MEPA
+source, is archived; mesa took over) -- no dependency on any other
+project -- and emits symbolic C enums:
 
-  * one enum ``lan80xx_mmd_t`` mapping each MDIO Manageable Device name
-    to its number (0x00..0x1F);
-  * one enum per MMD mapping each register name to its address offset
-    within that MMD.
+  * one enum ``lan80xx_mmd_t`` mapping each MDIO Manageable Device name to
+    its number (0x00..0x1F);
+  * one enum per MMD mapping each register name to its address offset.
 
-Enumerator values are the raw offsets, so the mmd (device) and the addr
-(offset) stay independent, matching the SPI instruction layout the
-daemon builds (slice<<21 | mmd<<16 | addr).
+It walks ``mepa/microchip/lan80xx/src/regs/regs_lan80xx_*.h`` for the
+``#define LAN80XX_... (LAN80XX_IOREG(MMD_ID_x, is32, offset))`` lines and
+resolves each MMD_ID_x symbol via ``lan80xx_regs_util.h``.
 
-Register names are kept verbatim (the canonical LAN80XX_ symbols from
-sw-mepa) so they can be used as drop-in constants. All enumerators live
-in one file scope, so a name that appears more than once (a handful of
-aliases do) is emitted once; the duplicate is dropped with a note.
+Enumerator values are the raw offsets, so mmd (device) and addr (offset)
+stay independent, matching the SPI instruction layout the daemon builds
+(slice<<21 | mmd<<16 | addr). Register names are kept verbatim (the
+canonical LAN80XX_ symbols). All enumerators share one file scope, so a
+name that appears more than once (a few aliases do) is emitted once; the
+duplicate is dropped with a note.
 
 Usage:
-    gen_lan80xx_regs_header.py <lan80xx_reg_table.h> <lan80xx_regs.h>
+    gen_lan80xx_regs_header.py <mesa-root> <lan80xx_regs.h>
 """
 
 from __future__ import annotations
@@ -31,17 +32,20 @@ import re
 import sys
 from pathlib import Path
 
-ENTRY_RE = re.compile(
-    r'\{\s*"(LAN80XX_[A-Z0-9_]+)"\s*,\s*'
-    r"0x([0-9A-Fa-f]+)U\s*,\s*"      # mmd
-    r"([01])U\s*,\s*"               # is32
-    r"0x([0-9A-Fa-f]+)U\s*\}"       # addr
+REG_RE = re.compile(
+    r"^\s*#define\s+(LAN80XX_[A-Z0-9_]+)\s+"
+    r"\(LAN80XX_IOREG\(\s*(MMD_ID_[A-Z0-9_]+)\s*,\s*([01])\s*,\s*"
+    r"(0[xX][0-9a-fA-F]+|\d+)\s*\)\s*\)\s*$"
+)
+
+MMD_RE = re.compile(
+    r"^\s*#define\s+(MMD_ID_[A-Z0-9_]+)\s+\(\s*(0[xX][0-9a-fA-F]+|\d+)U?\s*\)"
 )
 
 MMD_MAX = 0x20  # mmd is 5-bit
 
-# Human-readable name + one-line note per MMD number. Kept in one place
-# so the generated header documents the address map.
+# Human-readable name + note per MMD number. Kept in one place so the
+# generated header documents the address map.
 MMD_INFO = {
     0x01: ("LINE_PMA",     "line PMA/PMD (+ slice / RS-FEC / PCS / SFP)"),
     0x03: ("MAC_LINE_PCS", "host+line MAC, line PCS/PCS25G"),
@@ -56,19 +60,37 @@ MMD_INFO = {
 }
 
 
-def parse(table_path: Path) -> dict[int, list[tuple[int, str]]]:
-    """Returns {mmd: [(addr, name), ...]} in address order."""
+def parse_mmd_ids(util_header: Path) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in util_header.read_text().splitlines():
+        m = MMD_RE.match(line)
+        if m:
+            out[m.group(1)] = int(m.group(2), 0)
+    return out
+
+
+def parse(mesa: Path) -> dict[int, list[tuple[int, str]]]:
+    """Returns {mmd: [(addr, name), ...]} from mesa, in address order."""
+    util = mesa / "mepa/microchip/lan80xx/src/lan80xx_regs_util.h"
+    regs_dir = mesa / "mepa/microchip/lan80xx/src/regs"
+    if not util.exists() or not regs_dir.is_dir():
+        raise FileNotFoundError(f"mesa layout not found under {mesa}")
+    mmd_ids = parse_mmd_ids(util)
     by_mmd: dict[int, list[tuple[int, str]]] = {}
-    for line in table_path.read_text().splitlines():
-        m = ENTRY_RE.search(line)
-        if not m:
-            continue
-        name, mmd, _is32, addr = m.groups()
-        mmd_i = int(mmd, 16)
-        if mmd_i >= MMD_MAX:
-            sys.stderr.write(f"skipping out-of-range mmd 0x{mmd_i:X} ({name})\n")
-            continue
-        by_mmd.setdefault(mmd_i, []).append((int(addr, 16), name))
+    for header in sorted(regs_dir.glob("regs_lan80xx_*.h")):
+        for line in header.read_text().splitlines():
+            m = REG_RE.match(line)
+            if not m:
+                continue
+            name, mmd_sym, _is32, offset = m.groups()
+            mmd_val = mmd_ids.get(mmd_sym)
+            if mmd_val is None:
+                continue                # unknown MMD symbol -- skip, don't guess
+            if mmd_val >= MMD_MAX:
+                sys.stderr.write(
+                    f"skipping out-of-range mmd 0x{mmd_val:X} ({name})\n")
+                continue
+            by_mmd.setdefault(mmd_val, []).append((int(offset, 0), name))
     for regs in by_mmd.values():
         regs.sort(key=lambda r: (r[0], r[1]))
     return by_mmd
@@ -78,13 +100,13 @@ def mmd_label(mmd: int) -> str:
     return MMD_INFO.get(mmd, (f"MMD_{mmd:02X}", "unclassified"))[0]
 
 
-def emit(out_path: Path, src_name: str,
-         by_mmd: dict[int, list[tuple[int, str]]]) -> None:
+def emit(out_path: Path, by_mmd: dict[int, list[tuple[int, str]]]) -> None:
     L: list[str] = [
         "// Copyright (c) 2026 Vincent Jardin, Vincent Cruz, Free Mobile",
         "// SPDX-License-Identifier: BSD-4-Clause",
         "//",
-        f"// Auto-generated by gen_lan80xx_regs_header.py from {src_name}.",
+        "// Auto-generated by gen_lan80xx_regs_header.py from mesa's"
+        " regs_lan80xx_*.h.",
         "// Do not edit by hand; re-run the generator instead.",
         "//",
         "// Symbolic enums for the LAN80xx MDIO Manageable Devices (MMDs)",
@@ -136,16 +158,17 @@ def main(argv: list[str]) -> int:
     if len(argv) != 3:
         sys.stderr.write(__doc__ or "")
         return 2
-    src = Path(argv[1])
+    mesa = Path(argv[1])
     out = Path(argv[2])
-    if not src.exists():
-        sys.stderr.write(f"input table not found: {src}\n")
+    try:
+        by_mmd = parse(mesa)
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"{exc}\n")
         return 1
-    by_mmd = parse(src)
     if not by_mmd:
-        sys.stderr.write(f"no register entries parsed from {src}\n")
+        sys.stderr.write(f"no register definitions parsed under {mesa}\n")
         return 1
-    emit(out, src.name, by_mmd)
+    emit(out, by_mmd)
     total = sum(len(v) for v in by_mmd.values())
     sys.stderr.write(
         f"emitted {total} register offsets across {len(by_mmd)} MMDs to {out}\n"
