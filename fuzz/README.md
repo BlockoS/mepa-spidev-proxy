@@ -72,6 +72,27 @@ dir):
 
     cmake --build build/cov --target fuzz_coverage_html
 
+## AFL++ (cracking the CRC / magic values)
+
+libFuzzer's random mutation rarely satisfies the mailbox response CRC or the
+discrete type/mmd/register constants, so those branches stay shallow. AFL++'s
+CMPLOG (redqueen) instrumentation solves comparisons directly. The same
+harness runs under AFL++ unchanged -- its clang wrapper links an AFL
+persistent-mode driver when it sees `-fsanitize=fuzzer`.
+
+    sudo apt-get install -y afl++      # 4.33+
+    fuzz/afl.sh                        # build build/afl/fuzz_msg_{afl,cmplog}
+    fuzz/afl.sh run 300                # build + fuzz 5 min (cmplog + dict)
+
+`fuzz_msg_afl` carries ASan+UBSan (the oracle); `fuzz_msg_cmplog` is the `-c`
+comparison-cracking companion. Findings land in
+`build/afl/out/default/crashes/`; reproduce one against the libFuzzer binary:
+
+    build/fuzz/fuzz_msg build/afl/out/default/crashes/id:000000*
+
+`fuzz/spiproxy.dict` lists the protocol's discrete constants; pass it to
+libFuzzer too with `-dict=fuzz/spiproxy.dict`.
+
 ## Scope and next steps
 
 - **Real scheduler + fuzzed device replies.** Each input is a `spi_feed`
@@ -89,6 +110,6 @@ dir):
 - **Transport framing bypassed.** Messages are handed to `enqueue()`
   directly, so `client_msg()`'s `ver`/`len` checks over `recv()` aren't
   covered -- add a harness over that layer if wanted.
-- **Depth.** Pair with AFL++ (`afl-clang-lto`, persistent mode + cmplog) to
-  crack the header/CRC magic values faster than coverage alone.
+- **Depth.** AFL++ CMPLOG cracks the mailbox CRC / magic-value branches that
+  coverage-only mutation stalls on -- see the AFL++ section above.
 - **CI.** ClusterFuzzLite in GitHub Actions gives short per-PR campaigns.
