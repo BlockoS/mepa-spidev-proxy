@@ -307,24 +307,34 @@ static int spi_read_reg(uint8_t slice, uint8_t mmd, uint16_t reg, uint32_t *val)
 {
     uint8_t tx0[SPI_BUF_MAX], rx0[SPI_BUF_MAX];
     uint8_t tx1[SPI_BUF_MAX], rx1[SPI_BUF_MAX];
-    /* thd;ssn (DS00006161 Table 4-23) = SCK period + 12 ns: the CS
-     * high time between the two frames scales with the clock period,
-     * or the chip misses the frame boundary and streams (the response
-     * slides 2 bytes early: bench-proven at 1 MHz in the raw tools)
-     * Delay the CS toggle by 2 SCK periods. */
-    struct spi_ioc_transfer tr[2] = {
-        { .tx_buf = (unsigned long)tx0, .rx_buf = (unsigned long)rx0,
-          .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
-          .bits_per_word = 8, .cs_change = 1,
-          .delay_usecs = (uint16_t)(SPI_CS_DELAY_SCK * USEC_PER_SEC / g.freq + 1) },
-        { .tx_buf = (unsigned long)tx1, .rx_buf = (unsigned long)rx1,
-          .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
-          .bits_per_word = 8 },
+    /* LAN80xx reads are one-transaction-delayed: the response to
+     * request N is clocked out during request N+1's data window.
+     * Issue the prime and capture as two separate SPI_IOC_MESSAGE(1)
+     * ioctls so the kernel spidev layer deasserts CS on the ioctl
+     * boundary. The earlier batched SPI_IOC_MESSAGE(2) + cs_change=1
+     * + delay_usecs form assumed the SPI controller would honour the
+     * chip's thd;ssn timing (DS00006161 Table 4-23) between chained
+     * transfers; some controllers do not, and reads then return
+     * varying garbage across restarts. Two separate ioctls match the
+     * mepa_spidev reference in Microchip's mepa_toolkit. */
+    struct spi_ioc_transfer tr_prime = {
+        .tx_buf = (unsigned long)tx0, .rx_buf = (unsigned long)rx0,
+        .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
+        .bits_per_word = 8,
+    };
+    struct spi_ioc_transfer tr_capture = {
+        .tx_buf = (unsigned long)tx1, .rx_buf = (unsigned long)rx1,
+        .len = SPI_BYTES + g.pad, .speed_hz = g.freq,
+        .bits_per_word = 8,
     };
     spi_fill(tx0, 0, spi_addr(slice, mmd, reg), 0);
     spi_fill(tx1, 0, spi_addr(slice, LAN80XX_MMD_GLOBAL,
                               LAN80XX_MCU_IO_MNGT_MISC_DEVICE_ID_REG), 0);
-    if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(2), tr) < 1) {
+    if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(1), &tr_prime) < 0) {
+        g.n_io_err++;
+        return -1;
+    }
+    if (ioctl(g.spi_fd, SPI_IOC_MESSAGE(1), &tr_capture) < 0) {
         g.n_io_err++;
         return -1;
     }
