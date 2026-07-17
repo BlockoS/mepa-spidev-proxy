@@ -32,11 +32,7 @@ desktop.ini
 *.profraw
 *.profdata
 
-# Generated, built on demand -- never committed:
-#   lan80xx_regs.h  -- the ClusterFuzzLite build.sh generates it in-tree
-#                      (the CMake build puts it under build/ instead)
-#   fuzz/corpus*    -- gen_seeds.py (CI / AFL / coverage build them)
-/lan80xx_regs.h
+# Generated seed corpus (gen_seeds.py; built on demand by CI / AFL / coverage)
 /fuzz/corpus/
 /fuzz/corpus_frame/
 /fuzz/corpus_resp/

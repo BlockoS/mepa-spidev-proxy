@@ -126,6 +126,28 @@ reproduce one against the libFuzzer binary:
 `fuzz/spiproxy.dict` lists the protocol's discrete constants; pass it to
 libFuzzer too with `-dict=fuzz/spiproxy.dict`.
 
+## Continuous fuzzing (ClusterFuzzLite)
+
+The daemon harnesses `fuzz_msg` and `fuzz_frame` run in GitHub Actions via
+ClusterFuzzLite -- free for this public repo. (`fuzz_resp` is not: under
+`SPIPROXY_FUZZ` `spiproxy_cli.c` compiles to so little that OSS-Fuzz's
+bad-build check rejects it as under-instrumented, so it stays a CMake/AFL local
+harness.) `.clusterfuzzlite/{Dockerfile,build.sh}` build them with the OSS-Fuzz
+toolchain (the engine supplies `main()`; `build.sh` ships the seed corpora and
+`spiproxy.dict`). Workflows in `.github/workflows/`:
+
+- `cflite-pr` — every PR to `main`, 300 s per harness under ASan and UBSan,
+  fails the check (with a SARIF annotation) on a new crash.
+- `cflite-batch` — daily 30 min run that grows the shared corpus and searches
+  deeper.
+- `cflite-cron` — daily corpus prune + a coverage report.
+
+The corpus persists in the Actions cache between runs; a dated baseline
+snapshot is published as a release asset (tag `fuzz-corpus-2026-07-10`,
+`mepa-spidev-proxy-fuzz-corpus.tar.zst`) for reproducible seeding. Reproduce a
+crash locally by feeding the saved testcase to `build/fuzz/fuzz_msg` (or
+`fuzz_frame`).
+
 ## Scope and next steps
 
 - **Real scheduler + fuzzed device replies.** Each input is a `spi_feed`
@@ -157,3 +179,4 @@ libFuzzer too with `-dict=fuzz/spiproxy.dict`.
   caught, not just memory errors.
 - **Depth.** AFL++ CMPLOG cracks the mailbox CRC / magic-value branches that
   coverage-only mutation stalls on -- see the AFL++ section above.
+- **CI.** ClusterFuzzLite in GitHub Actions gives short per-PR campaigns.
