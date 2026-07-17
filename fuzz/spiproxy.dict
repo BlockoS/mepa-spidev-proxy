@@ -1,0 +1,34 @@
+# spiproxy protocol tokens for coverage-guided fuzzing.
+# Usable by both libFuzzer (-dict=fuzz/spiproxy.dict) and AFL++ (-x ...).
+# These are the discrete constants the parser branches on; the mailbox
+# response CRC is not a constant and is left to AFL++ CMPLOG.
+
+# spiproxy_hdr.type (enum spiproxy_type)
+type_read="\x01"
+type_write="\x02"
+type_batch="\x03"
+type_claim="\x04"
+type_release="\x05"
+type_mailbox="\x06"
+type_stats="\x07"
+type_trace="\x08"
+type_reset="\x0c"
+
+# GLOBAL MMD -- the mailbox and its guarded register window live here
+mmd_global="\x1e"
+
+# mailbox command byte (spiproxy_mb.cmd)
+mb_cmd="\x19"
+
+# guarded mailbox register offsets (little-endian u16): 0xd800/0xd900/0xda00
+reg_mb_cmd="\x00\xd8"
+reg_mb_resp="\x00\xd9"
+reg_mb_flag="\x00\xda"
+
+# MB_FLAG bits (u32 LE): busy / response-ready
+mb_flag_busy="\x01\x00\x00\x00"
+mb_flag_resp="\x02\x00\x00\x00"
+
+# SPI_FAIL_MAGIC (u32 LE 0xE770FA11): a feed word that injects a read failure,
+# driving the I/O-error / mailbox-abort cleanup paths.
+spi_fail="\x11\xfa\x70\xe7"

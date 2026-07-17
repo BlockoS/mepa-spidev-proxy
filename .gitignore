@@ -27,3 +27,12 @@ desktop.ini
 
 # Local commit-message scratch (see COMMIT_MSG workflow)
 /COMMIT_MSG
+
+# Coverage / profiling artifacts (llvm source-based coverage)
+*.profraw
+*.profdata
+
+# Generated seed corpus (gen_seeds.py; built on demand by CI / AFL / coverage)
+/fuzz/corpus/
+/fuzz/corpus_frame/
+/fuzz/corpus_resp/

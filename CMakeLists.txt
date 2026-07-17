@@ -4,6 +4,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(mepa_spidev_proxy VERSION 2026.07 LANGUAGES C)
 
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)   # group fuzz_* targets in IDEs
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
@@ -12,9 +14,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(SPIPROXY_STATIC   "Link the executables statically" OFF)
 option(SPIPROXY_SANITIZE "Build with AddressSanitizer + UBSan (dev/CI)" OFF)
+option(SPIPROXY_FUZZ     "Build the libFuzzer request-parser harness (needs clang)" OFF)
+option(SPIPROXY_FUZZ_COVERAGE "Add clang source-coverage + a fuzz_coverage report target" OFF)
 
-if(SPIPROXY_SANITIZE AND SPIPROXY_STATIC)
-    message(FATAL_ERROR "SPIPROXY_SANITIZE and SPIPROXY_STATIC are mutually exclusive")
+if(SPIPROXY_STATIC AND (SPIPROXY_SANITIZE OR SPIPROXY_FUZZ))
+    message(FATAL_ERROR "SPIPROXY_STATIC is incompatible with SPIPROXY_SANITIZE / SPIPROXY_FUZZ")
 endif()
 
 set(MESA_ROOT_DIR "" CACHE PATH "Path to Microchip MESA source")
@@ -41,6 +45,9 @@ if(SPIPROXY_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
                         -fno-sanitize-recover=all)
     add_link_options(-fsanitize=address,undefined)
+elseif(SPIPROXY_FUZZ)
+    # The fuzz_msg target adds its own -fsanitize=fuzzer,address,undefined;
+    # keep _FORTIFY_SOURCE off globally (it conflicts with ASan).
 else()
     # Fortify libc buffer calls in optimized configs (inert otherwise); -U
     # first so it stays warning-free even when a buildroot/yocto toolchain
@@ -86,6 +93,13 @@ add_executable(spiproxy_cli spiproxy_cli.c parse.c)
 add_dependencies(spiproxy_cli gen_lan80xx_regs)
 target_include_directories(spiproxy_cli PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 set_target_properties(spiproxy_cli PROPERTIES OUTPUT_NAME "spiproxy-cli")
+
+# Fuzzing targets (harness + optional coverage reports) -- see fuzz/fuzz.cmake.
+# The SPIPROXY_FUZZ[_COVERAGE] options + their global flag interactions are
+# handled above; this only defines the targets, so it is included last.
+if(SPIPROXY_FUZZ)
+    include(fuzz/fuzz.cmake)
+endif()
 
 if (SPIPROXY_STATIC)
     target_link_options(lan80xx_spid PRIVATE -static)
